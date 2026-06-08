@@ -22,18 +22,25 @@ A lightweight vLLM implementation built from scratch.
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
 
+For local development in this repository, you can bootstrap a dedicated Conda environment, install the CLI tooling, and download the Qwen3 weights with:
+
+```bash
+bash scripts/setup_qwen3_env.sh
+```
+
 ## Model Download
 
-To download the model weights manually, use the following command:
+Nano-vLLM currently targets the Qwen3 architecture. To download the model weights with the current Hugging Face CLI, use:
+
 ```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
+hf download Qwen/Qwen3-0.6B \
+  --force-download \
+  --local-dir ./huggingface/Qwen3-0.6B
 ```
 
 ## Quick Start
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
+See `example.py` for usage. By default it reads the model from `./huggingface/Qwen3-0.6B`, and you can override that with `NANOVLLM_MODEL_PATH`. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
 ```python
 from nanovllm import LLM, SamplingParams
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
@@ -45,7 +52,7 @@ outputs[0]["text"]
 
 ## Benchmark
 
-See `bench.py` for benchmark.
+See `bench.py` for benchmark. It uses the same default model path as `example.py`.
 
 **Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)
