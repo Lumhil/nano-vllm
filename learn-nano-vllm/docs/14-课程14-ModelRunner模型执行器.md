@@ -650,7 +650,16 @@ else:
 
 ### 6.3 当前 CUDA Graph 的捕获方式
 
-`capture_cudagraph()` 里会先准备一套最大 buffer：
+这块如果只看“录一堆 graph”几个字，很容易看不懂它到底在录什么。先记住一句话：
+
+> **CUDA Graph 录下来的，不只是“模型前向这件事”，而是“在固定地址、固定 shape 的那一整串 GPU 操作”。**
+
+这句话的直接后果是：
+
+- graph 不能随便换一套新 tensor 地址来 replay
+- graph 也不能把 capture 时是 `bs=8` 的图，拿去当 `bs=37` 的图直接用
+
+所以 `capture_cudagraph()` 做的第一件事，不是立刻 capture，而是先造出一套**长期复用的固定 buffer**：
 
 - `input_ids`
 - `positions`
@@ -659,28 +668,155 @@ else:
 - `block_tables`
 - `outputs`
 
-然后构造一组批大小：
+你可以把它理解成：
+
+```text
+先在 GPU 上准备好一套“固定工位”
+  -> 后面所有 graph 都只认这套工位上的地址
+  -> 每次 replay 前，只往这些固定工位里改内容，不换地址
+```
+
+然后它会准备一组“愿意提前录下来”的 batch size：
 
 ```python
 self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
 ```
 
-也就是：
+这里的 `batch size` 在 **decode 路径** 下，指的不是 prompt 长度，也不是总 token 数，而是：
 
-- 小 batch 精细捕获：1、2、4、8
-- 大一些的 batch 按 16 对齐：16、32、48 ...
+> **这一轮同时参与 decode 的序列条数。**
 
-运行时，如果本轮 decode 的真实 batch size 是 `bs`，就选：
+之所以能这样理解，是因为 `prepare_decode()` 里每条序列只会贡献 1 个输入 token：
 
 ```python
-next(x for x in self.graph_bs if x >= bs)
+input_ids.append(seq.last_token)
 ```
 
-也就是**第一个不小于 `bs` 的 graph** 来回放。
+所以在 decode 场景下：
+
+```text
+input_ids.size(0) = bs = 这一步一起 decode 的序列数
+```
+
+例如：
+
+- `bs = 1`：这一步只有 1 条序列在 decode
+- `bs = 4`：这一步有 4 条序列一起 decode
+- `bs = 8`：这一步有 8 条序列一起 decode
+
+这组设计可以读成：
+
+- 小 batch 精细捕获：`1, 2, 4, 8`
+- 大 batch 稀疏捕获：`16, 32, 48, ...`
+
+为什么不把 `1..512` 每个 batch size 都录一遍？
+
+因为那样：
+
+- 初始化会更慢
+- graph 数量太多
+- graph 占用的显存和管理成本也会更高
+
+而当前实现认为：
+
+- 小 batch 在 decode 场景特别常见，而且 batch size 差 1 个时浪费比例很大，所以要录得细一点
+- 大 batch 时，`32` 和 `33` 之间差的那 1 个槽位，相对就没那么值得专门多录一张图，所以按 16 对齐更划算
+
+这里的“浪费比例”，说白了就是：
+
+> **真实只来了 `bs` 条序列，但你却用了一个更大的 captured graph，于是多出来的那些占位槽也会陪跑一遍前向。**
+
+这些多出来的占位槽虽然不会产生真实结果，但仍然会消耗一部分：
+
+- 无效计算
+- 显存带宽
+- KV / block table 等上下文读写
+
+如果用“graph 槽位利用率”的视角看，一个很直观的近似写法是：
+
+```text
+浪费比例 = (captured_bs - real_bs) / captured_bs
+```
+
+例如：
+
+- 真实 `bs=3`，却用 `graph-4`
+  浪费比例约为 `(4-3)/4 = 25%`
+- 真实 `bs=5`，却用 `graph-8`
+  浪费比例约为 `(8-5)/8 = 37.5%`
+- 真实 `bs=9`，却用 `graph-16`
+  浪费比例约为 `(16-9)/16 = 43.75%`
+
+所以小 batch 如果只做很稀疏的 capture，会更容易“差 1 条序列就跳到下一档大 graph”，这也是为什么 `1, 2, 4, 8` 这几档要录得更细。
+
+还有一个容易漏掉的细节是，源码里是：
+
+```python
+for bs in reversed(self.graph_bs):
+```
+
+也就是**从大到小** capture。这样第一张图通常是最大 batch 的图，后面：
+
+```python
+if self.graph_pool is None:
+    self.graph_pool = graph.pool()
+```
+
+会把第一次 capture 出来的 memory pool 记下来，后续更小的 graph 继续复用这套 pool。
+
+---
+
+再看“运行时到底怎么选图”。
+
+假设这轮 decode 的真实 batch size 是：
+
+```text
+bs = 6
+```
+
+当前实现会选：
+
+```python
+graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+```
+
+也就是：
+
+```text
+在 [1, 2, 4, 8, 16, 32, ...] 里，找第一个 >= 6 的值
+=> 8
+```
+
+所以这轮不会“临时新录一个 6 的 graph”，而是：
+
+> **直接拿 `bs=8` 那张已经录好的 graph 来 replay。**
+
+这就是“向上取整到最近一个已捕获 batch size”的含义。
+
+你可以把它想成：
+
+```text
+真实来了 6 条序列
+  -> 但我手里没有 graph-6
+  -> 我有 graph-8
+  -> 那就把前 6 个槽位当真数据
+  -> 剩下 2 个槽位当占位槽
+  -> replay 完只取前 6 条真正需要的输出
+```
+
+这一点和当前 `run_model()` 里的这句正好对上：
+
+```python
+return self.model.compute_logits(graph_vars["outputs"][:bs])
+```
+
+也就是说，即使底层 replay 用的是更大的 graph，最后真正拿去算 logits / 采样的，也只有前 `bs` 条输出。
 
 ### 6.4 Graph replay 前为什么要把上下文 buffer 重写一遍
 
-因为 graph capture 期间绑定的是固定地址的 buffer。
+因为 graph capture 时绑死的是**固定地址 + 固定 shape 的 buffer 视图**，所以 replay 时不能重新 new 一套输入张量再喂进去，而只能：
+
+> **继续使用 capture 当时那批 buffer，只是在 replay 前把里面的内容改成“这一轮真正的数据”。**
 
 所以实际 decode 时，不是重新分配新 tensor，而是把本轮的数据拷进旧 buffer：
 
@@ -696,9 +832,31 @@ graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_t
 
 这里：
 
-- `slot_mapping.fill_(-1)` 是把无效位置清掉
-- `context_lens.zero_()` 是把未使用尾部清掉
-- `block_tables` 则把本轮实际需要的那部分覆盖进去
+- `graph_vars["input_ids"][:bs] = input_ids`
+  只覆盖前 `bs` 个真实样本的位置
+- `slot_mapping.fill_(-1)`
+  把整块 buffer 先清成“无效 slot”，防止旧请求把 KV 写到错误位置
+- `context_lens.zero_()`
+  把尾部占位槽清成 0，表示这些额外槽位没有有效上下文
+- `block_tables[:bs, ...] = ...`
+  只覆盖这轮真实样本需要的那部分 block 映射
+
+如果还是拿前面的例子，真实 batch 是 `6`，但 replay 用的是 `graph-8`，那实际效果可以理解成：
+
+```text
+槽位 0~5：放这轮真实 6 条序列的数据
+槽位 6~7：保留为占位槽 / 无效槽
+```
+
+这些占位槽虽然也会跟着 graph 一起跑完整个前向，但：
+
+- 它们不会对应真实请求
+- 它们的输出最终会被丢弃
+- 真正返回给上层的仍然只是前 `bs` 条结果
+
+所以，这一整套机制的核心不是“每次都精确匹配一个新 graph”，而是：
+
+> **提前录少量常用 shape 的 graph，然后在 replay 时把真实 batch 塞进最接近、且不小于它的固定工位里。**
 
 这样 graph replay 才能在“地址不变”的前提下，吃到“内容更新”的输入。
 
@@ -731,6 +889,45 @@ def run(self, seqs, is_prefill):
   -> 再清 context
 ```
 
+这里有两个特别容易疑惑的点，最好现在就拆开：
+
+1. 这里的 `rank` 到底是什么？
+2. 为什么最后还要 `reset_context()`？
+
+先说第一个。
+
+这里的 `rank` 不是：
+
+- 请求编号
+- 序列编号
+- batch 里的下标
+
+它指的是：
+
+> **张量并行（TP）进程 / GPU 的编号。**
+
+在当前实现里：
+
+- `rank=0` 是主 rank
+- `rank=1,2,...` 是其他 TP rank
+
+可以直接和 `LLMEngine` / `ModelRunner.__init__()` 对上：
+
+- `LLMEngine` 会 `spawn` 出 `1..tp_size-1` 这些子进程
+- 主进程里自己构造 `ModelRunner(config, 0, ...)`
+- 每个进程再用 `dist.init_process_group(..., rank=rank)` 加入同一个 NCCL 进程组
+
+所以这里的：
+
+```python
+temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+```
+
+不是说“第 0 条序列负责采样”，而是说：
+
+> **只有 TP 里的主进程 `rank 0` 负责最终采样。**
+
 ### 7.2 为什么只有 rank 0 采样
 
 因为在张量并行里：
@@ -742,7 +939,21 @@ def run(self, seqs, is_prefill):
 
 ### 7.3 `reset_context()` 为什么不能漏
 
-`context` 是全局状态。
+最容易误解的一点是：`context` 不是“长期保存的模型状态”，而是：
+
+> **这一轮前向传播临时挂在全局位置上的一份执行上下文。**
+
+里面放的是这轮 attention / lm head 立刻要用、但又不想层层函数传参的那些信息，比如：
+
+- `is_prefill`
+- `slot_mapping`
+- `cu_seqlens_q / cu_seqlens_k`
+- `context_lens`
+- `block_tables`
+
+所以 `prepare_prefill()` / `prepare_decode()` 里会先 `set_context(...)`，让后面的 attention 和 lm head 能通过 `get_context()` 读到它。
+
+但这些信息只对**当前这一次 `run()`** 有意义。
 
 如果不在一次 `run()` 结束后清掉，下一轮可能会错误复用上一轮的：
 
@@ -752,6 +963,25 @@ def run(self, seqs, is_prefill):
 - `block_tables`
 
 这类“脏上下文串到下一轮”的 bug 非常难查，所以 `reset_context()` 是这里一个很关键但常被忽略的收尾动作。
+
+你可以把它想成：
+
+```text
+prepare_*() 先把这轮前向要用的草稿写到全局白板上
+  -> attention / lm head 读这块白板
+  -> 这轮 run() 结束
+  -> reset_context() 把白板擦干净
+```
+
+如果不擦，会发生什么？
+
+- 本轮明明是 decode，结果下轮还残留着上轮 prefill 的 `cu_seqlens`
+- 本轮只有 4 条序列，下轮却还残留上一轮 8 条序列的 `slot_mapping`
+- `block_tables` 或 `context_lens` 尾部保留旧值，导致 attention 读错历史
+
+所以这里“再清 context”不是可有可无的清理，而是为了保证：
+
+> **每一轮前向都只看到这一轮自己准备的上下文，而不会吃到上一轮残留的脏状态。**
 
 ---
 
