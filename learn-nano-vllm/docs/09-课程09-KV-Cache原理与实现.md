@@ -10,6 +10,45 @@
 - 区分 **Prefill** 与 **Decode** 阶段对 KV Cache 的读写模式。
 - 整理 **面试高频追问**（量化、多请求、GQA 对公式的影响）。
 
+## 先用人话讲完
+
+如果你只想先抓住主线，记住下面四句话就够了：
+
+1. **KV Cache 存的不是“文本”，而是每一层 attention 算出来的 K 和 V。**
+2. **有了 KV Cache，模型生成下一个 token 时，不用把前面所有 token 的 K/V 再算一遍。**
+3. **Prefill 像“第一次把整段提示词录进去”，Decode 像“之后每次只追加 1 个新 token”。**
+4. **nano-vllm 会先在 GPU 上开一整片 KV 内存池，再用 block 去切分和复用。**
+
+换句话说，KV Cache 做的事非常朴素：**把“已经算过、后面还会反复用到的历史 K/V”留下来，别重复劳动。**
+
+### 一个最小例子
+
+假设输入是：
+
+```text
+我 喜 欢
+```
+
+现在模型要继续生成下一个 token。
+
+- **没有 KV Cache**：
+  - 为了算当前位置的 attention，你往往又得把 `我`、`喜`、`欢` 对应的 K/V 全部重新算一次。
+- **有 KV Cache**：
+  - 前三个位点的 K/V 之前已经算好并存起来了；
+  - 这一步只需要为“当前新 token”算出新的 K/V，然后追加到缓存里；
+  - 当前 query 直接去读“历史缓存 + 当前新增”即可。
+
+所以它优化的重点不是“少算一点点”，而是**避免每一步都把整段历史重复做一遍**。
+
+### 这篇文档真正想回答的三个问题
+
+1. **为什么推理一定要 KV Cache？**
+   因为自回归解码是“每次只新增 1 个 token”，历史 K/V 天然适合复用。
+2. **KV Cache 到底占多少显存？**
+   这就是那条「层数 × 长度 × KV 头数 × head_dim × 2」公式在回答的问题。
+3. **在 nano-vllm 里，KV 是怎么放到 GPU 内存里的？**
+   关键代码就是 `ModelRunner.allocate_kv_cache()`、`prepare_prefill()`、`prepare_decode()` 和 `Attention.forward()`。
+
 ## 核心概念
 
 ### 1. 注意力里重复计算从何而来
@@ -30,17 +69,128 @@
 \text{KV\_bytes} \approx 2 \times L \times T \times H_{kv} \times D \times S_{\mathrm{dtype}} \times B
 \]
 
-其中：
+这条公式算的是：**KV Cache 大概要占多少字节显存**。本质上它只是在数两件事：
 
-- **2**：K 与 V 两份；
-- **\(L\)**：`num_hidden_layers`；
-- **\(T\)**：序列长度（或当前占用的 token 数上限）；
-- **\(H_{kv}\)**：`num_key_value_heads`（注意 **张量并行后要按 rank 取本地头数**）；
-- **\(D\)**：`head_dim`；
-- **\(S_{\mathrm{dtype}}\)**：单元素字节（fp16=2，bf16=2 等）；
-- **\(B\)**：batch 或并行序列数（依系统是否共享/分槽而定）。
+```text
+总共要存多少个元素
+×
+每个元素占多少字节
+```
 
-面试时强调：**GQA 用 \(H_{kv}\) 而非 \(H\)**，这是与 MHA 公式的重要区别。
+### 2.1 公式里的每个参数到底是什么意思
+
+- **`2`**
+  - 表示要存两份缓存：`K` 和 `V`。
+  - 如果 attention 只需要一份历史信息，公式里就不会有这个 `2`，但标准自注意力需要同时保存 K 和 V。
+
+- **`L`**
+  - 表示模型层数，也就是 `num_hidden_layers`。
+  - 因为 **每一层 attention 都有自己独立的 KV Cache**，所以显存会随层数线性增长。
+  - 例如 Qwen3-0.6B 的 `L = 28`，就意味着同一批 token 的 KV 要存 28 层。
+
+- **`T`**
+  - 表示单条序列当前缓存了多少个 token。
+  - 最好把它理解成 **“当前已经占住 KV Cache 的上下文长度”**，而不是死记为 `max_model_len`。
+  - 例如 prompt 有 1000 个 token，模型又生成了 200 个 token，那么这条序列当前大约就是 `T = 1200`。
+  - `T` 越大，KV Cache 线性变大，这也是长上下文特别吃显存的原因。
+
+- **`H_{kv}`**
+  - 表示 `num_key_value_heads`，也就是 **KV 头数**。
+  - 这里最容易搞错：它通常 **不是** `num_attention_heads`。
+  - 在 GQA 或 MQA 里，多个 query head 会共享同一组 KV head，所以缓存时只需要按 **真实 KV 头数** 计算。
+  - 面试时要强调：**GQA 用 \(H_{kv}\) 而非 \(H\)**，这是与标准 MHA 公式的重要区别。
+  - 如果做张量并行，还要按 rank 看本地头数，也就是代码里的 `num_key_value_heads // world_size`。
+
+- **`D`**
+  - 表示 `head_dim`，也就是每个 head 的向量维度。
+  - 你可以把它理解成：**一个 KV head 不是一个数，而是一整段长度为 `D` 的向量。**
+  - 在这个仓库的 Qwen3 配置里，`D = 128`。
+  - `D` 越大，每个 token 每层要存的数据就越多。
+
+- **`S_{\mathrm{dtype}}`**
+  - 表示单个元素占多少字节。
+  - 常见值：
+    - `fp32 = 4` bytes
+    - `fp16 = 2` bytes
+    - `bf16 = 2` bytes
+    - `int8 = 1` byte
+  - 这个仓库默认用 `bfloat16`，所以这里通常取 `2`。
+  - 工程上常说的 “KV Cache 量化”，本质上就是在降低这个因子。
+
+- **`B`**
+  - 表示并发序列数，可以先近似理解成 batch size。
+  - 因为每条序列都要维护自己的历史 KV，所以并发请求越多，总 KV Cache 占用越大。
+  - 不过这里要注意：`B × T` 是一个 **便于记忆的近似写法**，它默认所有序列长度都差不多。
+
+### 2.2 一个更精确但不那么好背的写法
+
+如果不同请求长度差很多，更精确的写法其实是：
+
+\[
+\text{KV\_bytes} \approx 2 \times L \times H_{kv} \times D \times S_{\mathrm{dtype}} \times \sum_i T_i
+\]
+
+这里的 \(\sum_i T_i\) 表示 **所有活跃序列当前占用的 token 总数**。
+
+所以：
+
+- `B × T` 适合快速估算和面试回答；
+- `\sum_i T_i` 更接近真实工程里的资源占用。
+
+### 2.3 这条公式到底在“数什么”
+
+换一种方式理解：
+
+- 每个 token
+- 在每一层
+- 要存 `H_{kv} × D` 个 K 元素
+- 还要存 `H_{kv} × D` 个 V 元素
+
+所以 **每个 token、每一层** 需要存：
+
+\[
+2 \times H_{kv} \times D
+\]
+
+个元素。
+
+再乘上：
+
+- `L` 层
+- `B` 条序列
+- 每条序列 `T` 个 token
+
+最后再乘每个元素的字节数 `S_{\mathrm{dtype}}`，就得到了总字节数。
+
+所以这条公式不是“背出来的”，而是顺着张量维度一项一项数出来的。
+
+### 2.5 代入 nano-vllm 的真实配置看一眼
+
+仓库自带的 `Qwen3-0.6B` 配置里，关键参数是：
+
+- `num_hidden_layers = 28`
+- `num_key_value_heads = 8`
+- `head_dim = 128`
+- `torch_dtype = bfloat16`，所以每个元素是 `2` 字节
+- 默认 `block_size = 256`
+
+如果先不考虑张量并行（`world_size = 1`），那么 **一个 block 在所有层上的 KV 总占用** 大约是：
+
+```text
+2 × 28 × 256 × 8 × 128 × 2 bytes
+= 29,360,128 bytes
+≈ 28 MB
+```
+
+这就是后面 `block_bytes` 那行代码在算的东西。
+
+所以你可以把 `num_kvcache_blocks` 直接理解成：
+
+```text
+GPU 剩余可分给 KV Cache 的显存 / 每个 block 的成本
+```
+
+这比硬背公式更容易落地。
 
 ### 3. nano-vllm 中的「块」与全局张量
 
@@ -57,7 +207,7 @@ KV Cache 在 decode 阶段的收益最大：若无 cache，每步都要对全长
 
 ## 源码解析：`ModelRunner.allocate_kv_cache`
 
-下面与 `nano-vllm-main/nanovllm/engine/model_runner.py` 一致。
+下面与当前仓库的 [`nanovllm/engine/model_runner.py`](/home/qrh/project/nano-vllm/nanovllm/engine/model_runner.py:103) 一致。
 
 ```python
 def allocate_kv_cache(self):
@@ -69,7 +219,7 @@ def allocate_kv_cache(self):
     current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
     num_kv_heads = hf_config.num_key_value_heads // self.world_size
     head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-    block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+    block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
     config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
     assert config.num_kvcache_blocks > 0
     self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
@@ -88,6 +238,14 @@ def allocate_kv_cache(self):
 - **`peak` / `current`**：分配器统计的峰值与当前分配，用于修正「warmup 已分配但未必常驻」等差异。
 
 整体意图：**在不超过用户设定利用率** 的前提下，估算还能容纳多少 **完整 KV block**。
+
+你可以把这段逻辑理解成：
+
+```text
+先看看 GPU 还剩多少预算
+再算一个 block 要花多少钱
+最后决定最多能开几个 block
+```
 
 ### `block_bytes` 的含义
 
@@ -126,6 +284,82 @@ v_cache = kv_cache[1, layer_id]
 ```
 
 这样前向时模块直接写自己的层切片，无需每层单独 `torch.empty`。
+
+---
+
+## 把代码执行路径串起来看
+
+只看 `allocate_kv_cache` 还是会有点悬空，因为它只解释了“内存池怎么开”，还没解释“谁往里写、谁从里读”。把下面四段代码串起来，KV Cache 就清楚很多了。
+
+### 第一步：启动时先分配整块 KV 内存池
+
+位置：[`nanovllm/engine/model_runner.py`](/home/qrh/project/nano-vllm/nanovllm/engine/model_runner.py:103)
+
+`ModelRunner.allocate_kv_cache()` 做两件事：
+
+1. 估算 GPU 还能放下多少个 KV block。
+2. 创建一个六维大张量 `self.kv_cache`，再把每层 attention 的 `k_cache`、`v_cache` 指向自己那一层的切片。
+
+这一步之后，每层 attention 都拿到了自己的“专属缓存视图”。
+
+### 第二步：Prefill/Decode 先决定“这次写到哪个槽位”
+
+位置：[`nanovllm/engine/model_runner.py`](/home/qrh/project/nano-vllm/nanovllm/engine/model_runner.py:129)
+
+- `prepare_prefill()` 会把一批 prompt 中这次要处理的 token，映射到一串连续或分页后的 `slot_mapping`。
+- `prepare_decode()` 会给每个序列只准备 **一个** 追加位置，也就是“下一个 token 应该写进哪个 slot”。
+
+这里的 `slot_mapping` 你可以简单理解成：
+
+```text
+逻辑上的第几个 token
+-> 物理上应该写进 KV Cache 的哪个格子
+```
+
+所以 **BlockManager 管的是“块号”**，而 **slot_mapping 管的是“最终写入地址”**。
+
+### 第三步：Attention 前向时，先把新的 K/V 写入缓存
+
+位置：[`nanovllm/layers/attention.py`](/home/qrh/project/nano-vllm/nanovllm/layers/attention.py:33)
+
+`Attention.forward()` 里最关键的是这句：
+
+```python
+store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+```
+
+意思是：
+
+- 当前这一步模型已经算出了新的 `k`、`v`
+- 现在按照 `slot_mapping`，把它们写到该层的 `k_cache`、`v_cache` 对应位置
+
+这里调用的是 Triton kernel `store_kvcache_kernel`。它做的事其实很直接：**按槽位把新 K/V 拷贝进缓存池**。
+
+### 第四步：写完之后，再决定这次 attention 怎么读缓存
+
+还是在 [`nanovllm/layers/attention.py`](/home/qrh/project/nano-vllm/nanovllm/layers/attention.py:43)：
+
+- 如果是 **Prefill**：
+  - 走 `flash_attn_varlen_func(...)`
+  - 一次处理多个 token
+  - 如果存在前缀复用，还会结合 `block_table` 直接从已有 cache 里读历史块
+- 如果是 **Decode**：
+  - 走 `flash_attn_with_kvcache(...)`
+  - 当前步通常只有一个 query
+  - 直接读取整段历史 `k_cache` / `v_cache`
+
+这也正是 KV Cache 最有价值的地方：**decode 时只新增一个 token，却能直接读完整历史缓存**。
+
+### 一句话串起来
+
+整个链路可以压缩成一句话：
+
+```text
+先分配 KV 大池
+-> 再为本次请求算出写入槽位
+-> attention 前向时把新 K/V 写进去
+-> 然后立刻拿历史 cache 做注意力计算
+```
 
 ---
 

@@ -1,767 +1,964 @@
 # 课程 14：ModelRunner 模型执行器
 
-本课深入剖析 nano-vllm 的 **ModelRunner**——它是**调度器与 GPU 之间的桥梁**，负责将调度器选出的序列转化为 GPU 可执行的张量输入，驱动模型前向传播，并返回采样结果。理解 ModelRunner 是理解推理引擎"执行层"的关键。
+> **学习目标**：把 `ModelRunner` 放回 nano-vllm 的完整执行链路中理解；分清它和 `Scheduler`、`Attention`、`Sampler` 的职责边界；掌握 `prepare_prefill()` / `prepare_decode()` 两条输入组织路径；理解 `slot_mapping`、`cu_seqlens`、`context_lens`、`block_tables` 各自服务哪个 kernel；看懂 CUDA Graph、多 GPU SharedMemory 通信，以及为什么这层是“调度器和 GPU 之间的翻译层”。
 
 ---
 
-## 一、ModelRunner 的职责
+## 零、先讲人话版
 
-### 1.1 总览
+如果你觉得这一课容易读晕，通常不是你不会，而是几个层次很容易被揉在一起了：
 
-ModelRunner 承担了推理引擎中**模型执行**的全部职责：
+- **请求（request）**：用户的一次生成任务。
+- **Sequence**：请求在引擎里的运行时对象。
+- **Scheduler**：决定“这轮谁上、每条序列这轮算多少 token”。
+- **ModelRunner**：决定“这些已被选中的序列，怎样变成 GPU 能吃的张量和上下文”。
+- **Attention**：真正读取这些张量和上下文，写 KV Cache，并做注意力计算。
 
+先记住一句最重要的话：
+
+> **ModelRunner 不决定“谁该算”，它只负责把 `Scheduler` 已经选好的序列，翻译成模型和 attention kernel 能执行的输入。**
+
+把整条链压缩成人话，就是：
+
+```text
+用户请求
+  -> 变成 Sequence
+  -> Scheduler.schedule() 选出这轮的 seqs，并写好 num_scheduled_tokens / is_prefill
+  -> ModelRunner.prepare_*() 把它们整理成 input_ids / positions / 各种上下文张量
+  -> Attention.forward() 写入 KV Cache 并做注意力
+  -> lm_head + sampler 产出 token
+  -> Scheduler.postprocess() 更新缓存进度、必要时 append_token、判断是否结束
 ```
-Scheduler.schedule()
-    ↓ 返回 (seqs: list[Sequence], is_prefill: bool)
-ModelRunner.run(seqs, is_prefill)
-    ├── prepare_prefill(seqs) / prepare_decode(seqs)   ← 构造输入张量
-    ├── run_model(input_ids, positions, is_prefill)     ← 前向传播
-    └── sampler(logits, temperatures)                   ← 采样下一个 token
-    ↓ 返回 token_ids: list[int]
-Scheduler.postprocess(seqs, token_ids)
-```
 
-### 1.2 六大职责
+这里先提前澄清 4 个最容易混淆的点：
 
-| 职责 | 说明 | 对应方法/阶段 |
-|------|------|-------------|
-| 模型加载 | 加载 HuggingFace 权重到 GPU | `__init__` |
-| KV Cache 分配 | 根据 GPU 显存计算并分配 KV Cache 空间 | `allocate_kv_cache()` |
-| 输入准备 | 将 Sequence 列表转换为 GPU 张量 | `prepare_prefill()` / `prepare_decode()` |
-| 模型执行 | 调用模型前向传播（eager 或 CUDA Graph） | `run_model()` |
-| 采样 | 从 logits 采样下一个 token | `sampler()` |
-| 多 GPU 通信 | TP > 1 时通过 SharedMemory 同步序列信息 | `write_shm()` / `loop()` |
+1. **`waiting` / `running` 是调度队列概念，不是 attention kernel 路径。**
+   某条序列被 `schedule()` 从 `waiting` 挪到 `running`，不代表它当前这一步已经在 decode；它只是说明“这轮 prompt 如果算完了，后续就进入 decode 轮转”。
+
+2. **`run(seqs, is_prefill)` 里的 `is_prefill` 是“这一整步走哪条执行路径”。**
+   在 nano-vllm 里，一次 `schedule()` 返回的这一批，要么整批 prefill，要么整批 decode。
+
+3. **`seq.is_prefill` 和 `run(..., is_prefill)` 不是一个层面的东西。**
+   前者是 `Sequence` 自己的调度态字段，尤其会影响跨进程序列化；后者是 `ModelRunner.run()` 这一轮到底走 `prepare_prefill()` 还是 `prepare_decode()`。
+
+4. **`prepare_prefill()` 不是“默认把整段剩余 prompt 全算完”。**
+   它只会处理 `Scheduler` 这轮安排给它的那一段，也就是 `seq.num_scheduled_tokens` 指定的 chunk。
+
+如果你读到后面开始晕，随时退回来，只盯这两句话：
+
+- `Scheduler` 决定“这轮算谁、算多少”。
+- `ModelRunner` 决定“这些 token 该怎么摆成 GPU 能执行的样子”。
 
 ---
 
-## 二、初始化流程
+## 一、先把边界讲清楚
 
-### 2.1 构造函数全景
+### 1.1 `ModelRunner` 到底不做什么
 
-```python
-class ModelRunner:
-    def __init__(self, config: Config, rank: int, event: Event):
-        self.rank = rank
-        self.world_size = config.tensor_parallel_size
+很多人第一次读到这里，会把 `ModelRunner` 想成“大总管”。其实它不是。
 
-        # 1. 初始化分布式通信
-        dist.init_process_group("nccl", "tcp://localhost:2333",
-                                world_size=self.world_size, rank=rank)
+它**不负责**：
 
-        # 2. 加载模型
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+- 决定 waiting 队列里谁优先
+- 决定 running 队列里谁被抢占
+- 决定 KV Cache block 分给哪条序列
+- 决定一条序列这一轮该算 1 个 token 还是 256 个 token
 
-        # 3. 初始化采样器
-        self.sampler = Sampler()
+这些都是 `Scheduler` + `BlockManager` 的职责。
 
-        # 4. 模型预热
-        self.warmup_model()
+### 1.2 它真正负责什么
 
-        # 5. 分配 KV Cache
-        self.allocate_kv_cache()
+`ModelRunner` 主要做 5 件事：
 
-        # 6. 捕获 CUDA Graph（如果不强制 eager 模式）
-        if not self.enforce_eager:
-            self.capture_cudagraph()
+| 职责 | 核心问题 | 对应方法 |
+|------|---------|---------|
+| 初始化模型执行环境 | 模型怎么加载到 GPU，执行环境怎么准备好？ | `__init__()` / `warmup_model()` |
+| 分配真实 KV Cache 张量，这里要和blockmanager做区别 | 显存里那块“装 K/V 的大仓库”怎么建？ | `allocate_kv_cache()` |
+| 组织本轮输入 | 已选中的 `Sequence` 如何变成 `input_ids / positions / context`？ | `prepare_prefill()` / `prepare_decode()` |
+| 执行模型前向 | 这轮走 eager 还是 CUDA Graph？ | `run_model()` |
+| 多卡协同执行 | rank 0 如何把方法调用和序列信息同步给其他 rank？ | `call()` / `write_shm()` / `loop()` |
 
-        # 7. 多 GPU 时，非 rank-0 进入事件循环
-        if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-            else:
-                self.shm = SharedMemory(name="nanovllm")
-                self.loop()  # 非 rank-0 永久阻塞在此
-```
+### 1.3 它和其他模块的关系
 
-### 2.2 初始化顺序的设计考量
+把几个相邻模块并排看，边界会清楚很多：
 
-初始化各步骤的顺序是精心设计的：
+| 模块 | 它负责回答的问题 |
+|------|----------------|
+| `Scheduler` | 这轮哪些序列上场？每条序列这轮算多少 token？ |
+| `BlockManager` | 这些序列占用哪些物理 block？是否还能 append / allocate？ |
+| `ModelRunner` | 这些序列如何整理成 attention kernel 能吃的张量？ |
+| `Attention` | 新算出来的 K/V 写到哪里？历史 K/V 从哪里读？怎么做注意力？ |
+| `Sampler` | logits 如何按 temperature 采样出下一个 token？ |
 
-**步骤 1：初始化 NCCL**
+所以，面试时如果被问“ModelRunner 的本质是什么”，一个很稳的回答是：
 
-```python
-dist.init_process_group("nccl", "tcp://localhost:2333",
-                        world_size=self.world_size, rank=rank)
-```
+> **它是调度层和算子层之间的翻译层。**
 
-必须在加载模型之前完成，因为张量并行的线性层（如 `ColumnParallelLinear`）在初始化时需要知道 `tp_rank` 和 `tp_size` 来确定权重分片方式。
+---
 
-**步骤 2：加载模型**
+## 二、初始化流程：让执行器进入“可跑”状态
+
+源码路径：`nanovllm/engine/model_runner.py`
+
+### 2.1 当前源码里的真实顺序
+
+当前 `__init__()` 的关键顺序是：
 
 ```python
+dist.init_process_group(...)
+torch.cuda.set_device(rank)
+torch.set_default_dtype(hf_config.dtype)
+torch.set_default_device("cuda")
+
 self.model = Qwen3ForCausalLM(hf_config)
 load_model(self.model, config.model)
-```
 
-先创建模型结构（此时权重为随机值），再从 HuggingFace 权重文件中加载参数。`load_model` 会调用每个层的 `weight_loader` 方法，处理张量并行时的权重分片。
-
-**步骤 3：模型预热（Warmup）**
-
-```python
+self.sampler = Sampler()
 self.warmup_model()
+self.allocate_kv_cache()
+
+if not self.enforce_eager:
+    self.capture_cudagraph()
+
+torch.set_default_device("cpu")
+torch.set_default_dtype(default_dtype)
+
+if self.world_size > 1:
+    if rank == 0:
+        self.shm = SharedMemory(...)
+        dist.barrier()
+    else:
+        dist.barrier()
+        self.shm = SharedMemory(...)
+        self.loop()
 ```
 
-用随机输入做一次前向传播。目的是：
-- 触发 PyTorch/CUDA 的 JIT 编译（如 Triton kernel 的编译）
-- 让 CUDA 分配器预分配内存池
-- 确保后续计算时不会因为首次编译导致延迟抖动
+建议你把这个顺序记成：
 
-**步骤 4：分配 KV Cache**
+```text
+先把分布式和 CUDA 环境立起来
+  -> 再建模型并加载权重
+  -> 再 warmup
+  -> 再算显存预算、分 KV Cache
+  -> 再捕获 CUDA Graph
+  -> 最后进入多卡协同运行
+```
 
-必须在 warmup 之后执行，因为 warmup 会占用一些 GPU 显存，分配 KV Cache 时需要知道**剩余**可用显存。
+### 2.2 为什么 `warmup_model()` 要在 `allocate_kv_cache()` 之前
 
-**步骤 5：捕获 CUDA Graph**
+因为 `allocate_kv_cache()` 不是拍脑袋分配，而是要看：
 
-必须在 KV Cache 分配之后执行，因为 CUDA Graph 捕获的前向传播中需要使用 KV Cache 张量。
+- 当前 GPU 总显存
+- 模型权重已经占了多少
+- warmup 过程中前向传播的峰值显存是多少
+- 当前 CUDA allocator 还保留了多少工作区
 
-### 2.3 分配 KV Cache：allocate_kv_cache()
+`warmup_model()` 的真实做法也不是“随便跑个零张量”，而是：
 
-这是 ModelRunner 最关键的初始化步骤之一：
+1. 先清空缓存、重置峰值统计；
+2. 构造几条假的 `Sequence`；
+3. 把它们的 `num_scheduled_tokens` 设成一个较大的 `seq_len`；
+4. 直接调用一次 `self.run(seqs, True)`；
+5. 再清一次缓存。
+
+也就是说，warmup 是用“和真实执行路径尽量接近”的方式，把：
+
+- Triton / CUDA kernel 编译
+- CUDA 内存池初始化
+- 前向峰值显存统计
+
+这些成本前置掉。
+
+### 2.3 `allocate_kv_cache()`：分配真正的 KV 仓库
+
+当前实现会先算每个 block 需要多少字节：
 
 ```python
-def allocate_kv_cache(self):
-    # 1. 查询 GPU 显存状态
-    free, total = torch.cuda.mem_get_info()
-
-    # 2. 计算每个 KV Cache block 的字节数
-    num_kv_heads = hf_config.num_key_value_heads // self.world_size
-    block_bytes = (2                           # K 和 V
-                  * hf_config.num_hidden_layers # 所有 Transformer 层
-                  * self.block_size             # block 中的 token 数
-                  * num_kv_heads                # KV 注意力头数
-                  * head_dim                    # 每个头的维度
-                  * hf_config.torch_dtype.itemsize)  # 数据类型字节数
-
-    # 3. 计算可分配的 block 数
-    config.num_kvcache_blocks = int(
-        total * config.gpu_memory_utilization   # 总显存的可用比例
-        - used                                  # 已用显存
-        - peak + current                        # 峰值预留
-    ) // block_bytes
-
-    # 4. 分配 KV Cache 张量
-    self.kv_cache = torch.empty(
-        2,                            # K 和 V
-        hf_config.num_hidden_layers,  # 层数
-        config.num_kvcache_blocks,    # block 数
-        self.block_size,              # 每 block 的 token 数
-        num_kv_heads,                 # KV 头数
-        head_dim                      # 头维度
-    )
-```
-
-#### KV Cache 张量的形状解读
-
-```
-kv_cache 的 6 维张量：
-  维度 0: [K, V]                     → 2
-  维度 1: [layer_0, ..., layer_N]    → num_hidden_layers
-  维度 2: [block_0, ..., block_M]    → num_kvcache_blocks
-  维度 3: [token_0, ..., token_B]    → block_size
-  维度 4: [head_0, ..., head_H]      → num_kv_heads
-  维度 5: [dim_0, ..., dim_D]        → head_dim
-```
-
-访问第 `l` 层、第 `b` 个 block、第 `t` 个 token 的 K 向量：
-
-```python
-k = kv_cache[0, l, b, t, :, :]  # shape: [num_kv_heads, head_dim]
-```
-
-#### 为什么 block 是第 2 维
-
-注意力计算时需要通过 `block_table` 索引物理 block。将 block 维放在靠前的位置，可以利用 `torch.index_select` 或 CUDA kernel 的连续内存访问模式，提高访存效率。
-
-#### 显存使用量的计算
-
-以 Qwen3-7B 为例（FP16, block_size=256）：
-
-```
-num_hidden_layers = 32
-num_kv_heads = 4（GQA，4 个 KV 头）
-head_dim = 128
-block_bytes = 2 × 32 × 256 × 4 × 128 × 2 = 16,777,216 bytes = 16 MB/block
-
-GPU 80GB, gpu_memory_utilization=0.9, 模型占用约 14 GB:
-可用 = 80 × 0.9 - 14 = 58 GB
-num_kvcache_blocks = 58 GB / 16 MB ≈ 3,625 blocks
-总 token 容量 = 3,625 × 256 ≈ 928,000 tokens
-```
-
-这意味着 KV Cache 可以同时容纳约 93 万个 token——足以支持数百个并发请求。
-
----
-
-## 三、prepare_prefill 详解
-
-### 3.1 方法签名与作用
-
-```python
-def prepare_prefill(self, seqs: list[Sequence]) -> tuple[list[int], list[int]]:
-```
-
-将一组待 prefill 的序列转换为模型前向传播所需的输入张量。
-
-### 3.2 核心数据结构
-
-```python
-def prepare_prefill(self, seqs):
-    input_ids = []       # 所有序列的 token ID 拼接（一维）
-    positions = []       # 每个 token 的位置编码索引
-    cu_seqlens_q = [0]   # Q 的累积序列长度
-    cu_seqlens_k = [0]   # K 的累积序列长度
-    slot_mapping = []    # 每个 token 对应的 KV Cache 物理位置
-```
-
-### 3.3 逐序列构造
-
-```python
-for seq in seqs:
-    seqlen = len(seq)
-    seqlen_q = seqlen - seq.num_cached_tokens   # Q 的长度（需计算的部分）
-    seqlen_k = seqlen                            # K 的长度（包含缓存部分）
-
-    # 1. 构造 input_ids：只包含未缓存的 token
-    input_ids.extend(seq[seq.num_cached_tokens:])
-
-    # 2. 构造 positions：从 num_cached_tokens 开始
-    positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-
-    # 3. 更新累积序列长度
-    cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-    cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-
-    # 4. 构造 slot_mapping
-    for i in range(seq.num_cached_blocks, seq.num_blocks):
-        block_id = seq.block_table[i]
-        num_tokens = seq.last_block_num_tokens if i == seq.num_blocks - 1 else self.block_size
-        for j in range(num_tokens):
-            slot_mapping.append(block_id * self.block_size + j)
-```
-
-### 3.4 关键概念：cu_seqlens
-
-`cu_seqlens`（cumulative sequence lengths）是 FlashAttention 变长接口的核心输入，用于标记每个序列在拼接后张量中的边界。
-
-```
-假设 3 个序列的 Q 长度分别为 [100, 150, 200]：
-cu_seqlens_q = [0, 100, 250, 450]
-
-在拼接后的张量中：
-- 序列 0 的 Q：位置 [0, 100)
-- 序列 1 的 Q：位置 [100, 250)
-- 序列 2 的 Q：位置 [250, 450)
-```
-
-**为什么 cu_seqlens_q 和 cu_seqlens_k 可能不同？**
-
-当存在前缀缓存命中时：
-
-```
-序列长度 = 300, num_cached_tokens = 256
-seqlen_q = 300 - 256 = 44   （只计算 44 个新 token 的 Q）
-seqlen_k = 300               （注意力需要 attend 到所有 300 个位置的 K）
-```
-
-Q 比 K 短是因为：缓存部分的 KV 已经在 KV Cache 中，不需要重新计算 Q，但注意力仍需要与它们交互。此时 FlashAttention 走带 `block_table` 的分页注意力路径。
-
-### 3.5 关键概念：slot_mapping
-
-`slot_mapping` 将每个 token 映射到 KV Cache 中的物理位置（slot）。
-
-```
-物理位置 = block_id × block_size + block 内偏移
-
-例如：block_table = [5, 12], block_size = 256
-- token 0~255 → block 5, slot 5×256+0 到 5×256+255
-- token 256~299 → block 12, slot 12×256+0 到 12×256+43
-```
-
-在 Attention 层的前向传播中，新计算的 K 和 V 会被写入 `slot_mapping` 指定的位置：
-
-```python
-# attention.py
-cache_k = kv_cache[0][layer_idx]  # [num_blocks, block_size, num_kv_heads, head_dim]
-cache_k.view(-1, num_kv_heads, head_dim)[slot_mapping] = k
-```
-
-### 3.6 set_context 调用
-
-构造完所有输入后，将元数据设置到全局上下文中，供 Attention 层读取：
-
-```python
-set_context(True,                   # is_prefill = True
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            slot_mapping=slot_mapping,
-            block_tables=block_tables)
-```
-
-Attention 层通过 `get_context()` 获取这些信息，决定使用哪种注意力计算路径。
-
-### 3.7 完整示例
-
-假设 2 个序列：
-- seq_0: token_ids=[10,20,30,40], block_table=[5], num_cached_tokens=0
-- seq_1: token_ids=[50,60,70], block_table=[8], num_cached_tokens=0
-
-构造结果：
-
-```
-input_ids  = [10, 20, 30, 40, 50, 60, 70]
-positions  = [0, 1, 2, 3, 0, 1, 2]
-cu_seqlens_q = [0, 4, 7]
-cu_seqlens_k = [0, 4, 7]
-slot_mapping = [5×256+0, 5×256+1, 5×256+2, 5×256+3,
-                8×256+0, 8×256+1, 8×256+2]
-```
-
----
-
-## 四、prepare_decode 详解
-
-### 4.1 方法实现
-
-```python
-def prepare_decode(self, seqs):
-    input_ids = []
-    positions = []
-    slot_mapping = []
-    context_lens = []
-    block_tables = []
-
-    for seq in seqs:
-        # 1. 输入只有 1 个 token：最后生成的 token
-        input_ids.append(seq.last_token)
-
-        # 2. 位置是序列总长度 - 1
-        positions.append(len(seq) - 1)
-
-        # 3. slot_mapping：新 token 写入最后一个 block 的下一个位置
-        slot_mapping.append(
-            seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
-        )
-
-        # 4. context_lens：注意力需要 attend 到的历史长度
-        context_lens.append(len(seq))
-
-        # 5. block_tables：该序列的所有物理 block ID
-        block_tables.append(seq.block_table)
-```
-
-### 4.2 与 prepare_prefill 的关键区别
-
-| 特性 | prepare_prefill | prepare_decode |
-|------|----------------|----------------|
-| 每序列 token 数 | len(seq) - num_cached_tokens | 1（只有 last_token） |
-| 位置编码 | range(num_cached_tokens, len(seq)) | len(seq) - 1 |
-| slot_mapping 含义 | 所有需写入的 slot | 只有 1 个新 slot |
-| cu_seqlens | 需要（变长注意力） | 不需要 |
-| context_lens | 不需要（由 cu_seqlens_k 隐含） | 需要（每序列的 KV 长度） |
-| 注意力路径 | flash_attn_varlen_func | flash_attn_with_kvcache |
-
-### 4.3 slot_mapping 的计算
-
-```python
-slot_mapping.append(
-    seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+block_bytes = (
+    2
+    * num_hidden_layers
+    * block_size
+    * num_kv_heads
+    * head_dim
+    * dtype.itemsize
 )
 ```
 
-这行代码定位新 token 的 KV 应该写入 KV Cache 的哪个位置：
+这里的 `2` 表示 K 和 V 两份缓存。
 
-```
-假设 seq.block_table = [5, 12], block_size = 256, num_tokens = 300
-last_block_num_tokens = 300 - 1×256 = 44
-slot = 12 × 256 + 44 - 1 = 12 × 256 + 43 = 3115
-
-这是因为 append_token 在 postprocess 中调用，此时 num_tokens 已经包含了新 token。
-所以 last_block_num_tokens 已经包含新 token，slot 指向新 token 的位置。
-```
-
-等等，这里有一个微妙之处：`prepare_decode` 在 `append_token` **之前**被调用。此时 `num_tokens` 还没有包含新 token。
-
-实际上在 nano-vllm 中，`may_append` 在 `schedule()` 中已经为新 token 预留了 block（如果需要）。而 `slot_mapping` 的计算使用的是**当前** `last_block_num_tokens`，它指向的是当前最后一个已填充的位置——也就是新 token 应该写入的下一个位置。
-
-具体流程：
-
-```
-1. postprocess 上一步：append_token → num_tokens = N
-2. schedule 本步：may_append（如果 N % block_size == 1，分配新 block）
-3. prepare_decode：slot = block_table[-1] × block_size + last_block_num_tokens - 1
-   = block_table[-1] × block_size + (N - (num_blocks-1) × block_size) - 1
-```
-
-这里 `last_block_num_tokens - 1` 对应的是 **0-based 索引**中的最后一个已填充位置。新的 KV 将写入这个位置。
-
-### 4.4 block_tables 的处理
+然后根据显存预算算出：
 
 ```python
-block_tables.append(seq.block_table)
+config.num_kvcache_blocks = available_bytes // block_bytes
 ```
 
-在 `set_context` 中，所有序列的 `block_table` 会被合并为一个二维张量，传递给 Attention 核：
+最后分配一个大张量：
 
 ```python
-# 所有序列的 block_table 填充到同一矩阵（Padding 到最长）
-block_tables_tensor = torch.zeros(num_seqs, max_num_blocks, dtype=torch.int32)
-for i, bt in enumerate(block_tables):
-    block_tables_tensor[i, :len(bt)] = torch.tensor(bt)
+self.kv_cache = torch.empty(
+    2,
+    num_hidden_layers,
+    num_kvcache_blocks,
+    block_size,
+    num_kv_heads,
+    head_dim,
+)
 ```
 
-Attention 核通过 `block_tables_tensor[seq_idx]` 查找对应序列的物理 block。
+它的维度可以读成：
+
+```text
+[K_or_V, layer, physical_block, token_offset_in_block, kv_head, head_dim]
+```
+
+接着 `allocate_kv_cache()` 会把每层 attention 模块的：
+
+- `module.k_cache`
+- `module.v_cache`
+
+直接指向这块全局 KV Cache 的某一层切片。这样后面 `Attention.forward()` 写缓存时，就不需要再去“找仓库”，它已经拿到了自己这层对应的那一片。
+
+### 2.4 为什么 CUDA Graph 捕获放在后面
+
+因为 graph capture 期间，模型前向里会真的访问：
+
+- `slot_mapping`
+- `context_lens`
+- `block_tables`
+- 以及 attention 内部已经挂到模块上的 `k_cache / v_cache`
+
+如果 KV Cache 还没分好，capture 就没有可靠的执行环境。
 
 ---
 
-## 五、run_model 方法
+## 三、Prefill 路径：`prepare_prefill()` 到底在准备什么
 
-### 5.1 Eager 模式 vs CUDA Graph 模式
+### 3.1 一句话先说透
 
-```python
-def run_model(self, input_ids, positions, is_prefill):
-    if is_prefill or self.enforce_eager:
-        logits = self.model(input_ids, positions)   # 直接调用模型
-    else:
-        logits = self.graph_runners[len(input_ids)].run(input_ids, positions)
-```
+`prepare_prefill(seqs)` 干的不是“把整条 prompt 都送进去”，而是：
 
-**Eager 模式**：直接调用 PyTorch 模型前向传播。每次都会重新发起所有 CUDA kernel，有 CPU→GPU launch 开销。Prefill 阶段**始终使用 Eager 模式**，因为 Prefill 的 batch 形状（总 token 数）变化很大，难以预先捕获 CUDA Graph。
+> **把这些序列本轮被调度到的 prompt 片段，拼成 FlashAttention prefill kernel 需要的输入。**
 
-**CUDA Graph 模式**：Decode 阶段使用。预先捕获好的 CUDA Graph 包含了所有 kernel 的调用序列，运行时只需一次 `graph.replay()`，消除了 CPU→GPU 的 launch 开销。对于 Decode 这种单 token 计算量小但 kernel 数量多的场景，CUDA Graph 的加速效果显著。
+这里“本轮被调度到的片段”是关键，因为 `Scheduler` 可能让一条长 prompt 分多轮 prefill。
 
-### 5.2 为什么 Prefill 不用 CUDA Graph
+### 3.2 当前源码里的核心变量
 
-1. **输入长度不固定**：不同请求的 prompt 长度差异巨大（几十到几千 tokens），无法枚举所有可能的输入形状
-2. **计算量大**：Prefill 的 kernel 执行时间远大于 launch 开销，CUDA Graph 的收益微小
-3. **FlashAttention 的限制**：变长注意力（`flash_attn_varlen_func`）对 CUDA Graph 的支持有限
-
-### 5.3 CUDA Graph 的 batch size 选择
+源码里最关键的 4 个量是：
 
 ```python
-def capture_cudagraph(self):
-    for bs in capture_batch_sizes():
-        self.graph_runners[bs] = CUDAGraphRunner(self.model, bs)
+start = seq.num_cached_tokens
+seqlen_q = seq.num_scheduled_tokens
+end = start + seqlen_q
+seqlen_k = end
 ```
 
-`capture_batch_sizes()` 返回需要预捕获的 batch size 列表。通常包括 1 到 `max_num_seqs` 的所有值（或某些常用值）。
+它们分别表示：
 
-运行时，如果实际 batch size 不在预捕获的列表中，则 fallback 到 Eager 模式。
+| 变量 | 含义 |
+|------|------|
+| `start` | 这条序列前面已经有多少 token 的 KV Cache 了 |
+| `seqlen_q` | 这轮真正要计算多少个新 token |
+| `end` | 这轮算完以后，历史总长度会走到哪里 |
+| `seqlen_k` | 这轮注意力能看到的总上下文长度，也就是 `end` |
+
+注意这个设计的含义：
+
+- `Q` 只对应“这轮新算的那一段”
+- `K/V` 的逻辑上下文长度对应“到当前为止全部可见的历史”
+
+这就是为什么 prefill 场景里经常会出现：
+
+```text
+seqlen_k > seqlen_q
+```
+
+### 3.3 这和“整段 prompt prefill”有什么区别
+
+假设一条序列当前状态是：
+
+```text
+prompt 总长 = 1000
+num_cached_tokens = 256
+num_scheduled_tokens = 128
+```
+
+那这轮 `prepare_prefill()` 处理的不是剩下全部 `744` 个 token，也不是整个 `1000` 个 token，而是：
+
+```text
+start = 256
+end = 384
+
+这轮 input_ids = seq[256:384]
+这轮 positions = [256, 257, ..., 383]
+这轮 Q 长度 = 128
+这轮 K 长度 = 384
+```
+
+也就是说，这轮只是“继续把 prompt 的第 256 到 383 个 token 算掉”。
+
+这正是课程 12 里讲的部分 prefill / chunked prefill 思路，在 `ModelRunner` 里的真实落地。
+
+### 3.4 `input_ids` 和 `positions` 怎么拼
+
+当前实现会把所有序列本轮要算的 token 直接拼成一维：
+
+```python
+input_ids.extend(seq[start:end])
+positions.extend(range(start, end))
+```
+
+所以 prefill 的输入布局不是 `[batch, seq_len]` 的 dense padding 形式，而是：
+
+```text
+多条变长序列的本轮 Q token，直接首尾相接拼成一条长向量
+```
+
+这正是 `flash_attn_varlen_func` 喜欢的输入组织方式。
+
+### 3.5 `cu_seqlens_q` / `cu_seqlens_k` 是干什么的
+
+因为大家都被拼到了一起，所以必须额外告诉 kernel：
+
+- 每条序列的 Q 边界在哪里
+- 每条序列的 K 边界在哪里
+
+这就是 `cu_seqlens_*` 的作用。
+
+例如 3 条序列这轮的 `seqlen_q` 分别是 `[4, 6, 3]`：
+
+```text
+cu_seqlens_q = [0, 4, 10, 13]
+```
+
+FlashAttention 就知道：
+
+- 第 0 条序列的 Q 在 `[0, 4)`
+- 第 1 条序列的 Q 在 `[4, 10)`
+- 第 2 条序列的 Q 在 `[10, 13)`
+
+而 `cu_seqlens_k` 用同样方法描述 K 的边界。
+
+### 3.6 `slot_mapping`：新算出的 K/V 到底写去哪里
+
+这部分特别重要。
+
+`slot_mapping` 不是逻辑 token 下标，而是 KV Cache 里的**物理扁平 slot**：
+
+```text
+slot = physical_block_id * block_size + offset_in_block
+```
+
+`prepare_prefill()` 会只为本轮 `[start, end)` 这段 token 生成 slot：
+
+```python
+for i in range(start_block, end_block):
+    ...
+    slot_mapping.extend(range(slot_start, slot_end))
+```
+
+也就是说，`slot_mapping` 的长度会和这轮新算的 token 数严格对齐。
+
+后面在 `attention.py` 里，`Attention.forward()` 一上来就会：
+
+```python
+store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+```
+
+意思非常直接：
+
+- 这轮新算出来的每个 `k / v`
+- 按照 `slot_mapping`
+- 写进对应的物理缓存位置
+
+### 3.7 `block_tables` 为什么有时是 `None`
+
+当前实现里：
+
+```python
+if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
+    block_tables = self.prepare_block_tables(seqs)
+```
+
+这说明只要“可见历史长度”大于“本轮新算长度”，就需要给 attention 一个 `block_tables`。
+
+这类场景不只包括“跨请求前缀缓存命中”，还包括更广义的：
+
+- 前缀缓存命中
+- 上一轮已经 prefill 过一部分，这一轮继续 partial prefill
+
+从 attention kernel 的视角看，它们本质上都是同一件事：
+
+> **Q 只是一小段新 token，但 K/V 需要同时覆盖已经在 KV Cache 里的旧前缀。**
+
+`prepare_block_tables(seqs)` 会把每条序列的 `seq.block_table` padding 到同样长度，并用 `-1` 填补无效位置，形成二维 `int32` 张量。
+
+### 3.8 `set_context(True, ...)`：把元数据交给后面的层
+
+prefill 最后会把这些元信息塞进全局上下文：
+
+```python
+set_context(
+    True,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    slot_mapping,
+    None,
+    block_tables,
+)
+```
+
+后面模型里的 attention 层、lm head 都会通过 `get_context()` 读取这些信息。
 
 ---
 
-## 六、run 方法完整流程
+## 四、Decode 路径：`prepare_decode()` 为什么完全是另一套组织方式
 
-### 6.1 方法实现
+### 4.1 Decode 的核心心智模型
+
+Decode 阶段每条序列这一轮只做一件事：
+
+> **拿“当前最后一个 token”作为输入，结合历史 KV Cache，预测“下一个 token”。**
+
+所以它和 prefill 最大的差别是：
+
+- prefill 一条序列这一轮可能算很多 token
+- decode 一条序列这一轮只算 1 个 token
+
+### 4.2 当前源码里的真实构造
+
+源码是：
+
+```python
+for seq in seqs:
+    input_ids.append(seq.last_token)
+    positions.append(len(seq) - 1)
+    context_lens.append(len(seq))
+    slot_mapping.append(
+        seq.block_table[-1] * self.block_size
+        + seq.last_block_num_tokens - 1
+    )
+```
+
+逐项解释：
+
+| 字段 | 含义 |
+|------|------|
+| `input_ids.append(seq.last_token)` | 这轮输入就是当前最后一个 token |
+| `positions.append(len(seq) - 1)` | 它在序列中的位置就是当前最后位置 |
+| `context_lens.append(len(seq))` | 这轮注意力要看到的历史长度 |
+| `slot_mapping.append(...)` | 这个 `last_token` 自己对应的 KV 应该写到哪里 |
+
+### 4.3 最容易讲错的一点：decode 的 `slot_mapping` 指向什么
+
+很多资料会把这里说成“给下一个 token 预留位置”，这在当前实现里是不准确的。
+
+当前 decode 步里，模型输入的是：
+
+```text
+当前 last_token
+```
+
+因此，这一步算出来的 `k / v` 也是这个 `last_token` 自己的 K/V，它应当写到：
+
+```text
+当前最后一个已占用逻辑位置对应的物理 slot
+```
+
+也就是：
+
+```python
+seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1
+```
+
+可以这样理解：
+
+1. 上一步 `postprocess()` 已经把新 token append 进 `Sequence` 了；
+2. 这一轮 decode 读取的就是这个新的 `last_token`；
+3. 所以它的 K/V 当然也该落在它自己的位置上；
+4. 这一轮模型输出的 logits，用来预测**再下一个** token。
+
+### 4.4 `context_lens` 和 `block_tables` 为什么 decode 必需
+
+decode 不需要 `cu_seqlens_q / cu_seqlens_k`，因为每条序列的 Q 长度固定就是 1。
+
+但它必须告诉 kernel 两件事：
+
+1. **每条序列当前历史有多长**：`context_lens`
+2. **这些历史 token 分布在哪些物理 block 里**：`block_tables`
+
+所以 decode 最后会做：
+
+```python
+block_tables = self.prepare_block_tables(seqs)
+set_context(
+    False,
+    slot_mapping=slot_mapping,
+    context_lens=context_lens,
+    block_tables=block_tables,
+)
+```
+
+### 4.5 Prefill 和 Decode 的对照表
+
+| 维度 | Prefill | Decode |
+|------|---------|--------|
+| 每条序列本轮输入 token 数 | `num_scheduled_tokens`，可能大于 1 | 固定为 1 |
+| `input_ids` 来源 | `seq[start:end]` | `seq.last_token` |
+| `positions` | `range(start, end)` | `len(seq) - 1` |
+| 描述边界的方法 | `cu_seqlens_q / cu_seqlens_k` | `context_lens` |
+| `slot_mapping` 含义 | 本轮新算 token 的所有物理写入位置 | 当前 `last_token` 的物理写入位置 |
+| `block_tables` | 仅在需要读历史 KV 时准备 | 总是需要 |
+| 对应 attention kernel | `flash_attn_varlen_func` | `flash_attn_with_kvcache` |
+
+---
+
+## 五、Attention 层眼里，`ModelRunner` 其实在喂什么
+
+如果你只看 `ModelRunner`，很容易觉得它在“拼很多杂乱的辅助张量”。但一旦把它和 `Attention.forward()` 对上，所有字段都会非常清晰。
+
+源码路径：`nanovllm/layers/attention.py`
+
+### 5.1 `Attention.forward()` 的真实顺序
+
+当前实现是：
+
+```python
+context = get_context()
+
+if k_cache.numel() and v_cache.numel():
+    store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+
+if context.is_prefill:
+    if context.block_tables is not None:
+        k, v = k_cache, v_cache
+    o = flash_attn_varlen_func(...)
+else:
+    o = flash_attn_with_kvcache(...)
+```
+
+这段代码非常值得反复看，因为它把 `ModelRunner` 的职责边界钉死了：
+
+> **ModelRunner 不做 attention 数学本身，它主要负责把“本轮这些 token 的上下文关系和物理落点”描述清楚。**
+
+### 5.2 这些上下文字段分别服务谁
+
+| 字段 | 谁在使用 | 用来干什么 |
+|------|---------|-----------|
+| `slot_mapping` | `store_kvcache()` | 把新算出来的 K/V 写入正确物理位置 |
+| `cu_seqlens_q / cu_seqlens_k` | `flash_attn_varlen_func` | 告诉 prefill kernel 变长序列边界 |
+| `max_seqlen_q / max_seqlen_k` | `flash_attn_varlen_func` | 告诉 kernel 本批最大长度，便于 launch |
+| `context_lens` | `flash_attn_with_kvcache` | 告诉 decode kernel 每条序列当前历史长度 |
+| `block_tables` | 两条路径都可能用 | 把逻辑 token 位置映射到分页 KV Cache 的物理 block |
+
+### 5.3 为什么 prefill 里有时也会去读 `k_cache / v_cache`
+
+这点经常被忽略。
+
+在 prefill 路径里，如果：
+
+```python
+context.block_tables is not None
+```
+
+当前实现会先：
+
+```python
+k, v = k_cache, v_cache
+```
+
+意思是：
+
+- 本轮的 Q 只针对新 token
+- 但 K/V 不再只来自本轮临时算出来的那一小段
+- 而是要从整块 paged KV Cache 里把历史前缀也一起拿进来参与注意力
+
+这正是 prefix cache / partial prefill 续算能够成立的关键。
+
+### 5.4 为什么 `run()` 最后总能返回“每条序列一个 token”
+
+一个容易疑惑的问题是：
+
+> prefill 输入明明可能有很多 token，为什么 `run()` 最后仍然只返回 `len(seqs)` 个采样结果？
+
+答案藏在 `ParallelLMHead.forward()` 里：
+
+```python
+if context.is_prefill:
+    last_indices = context.cu_seqlens_q[1:] - 1
+    x = x[last_indices].contiguous()
+```
+
+也就是说，在 prefill 场景下，lm head 会只取：
+
+```text
+每条序列本轮 Q 片段的最后一个位置
+```
+
+再对这些位置算 logits 并采样。
+
+注意这带来一个很细的结论：
+
+- 如果这轮 prefill 已经把整条 prompt 覆盖完了，那么这个采样结果会在 `postprocess()` 里真的 `append_token()`，成为首个生成 token；
+- 如果这轮只是部分 prefill，那么这个采样结果虽然算出来了，但 `postprocess()` 会先继续补缓存，不会立刻把它接到序列后面。
+
+---
+
+## 六、`run_model()`：何时 eager，何时 CUDA Graph
+
+### 6.1 当前实现的真实分支
+
+当前 `run_model()` 不是简单的“prefill 永远 eager，decode 永远 graph”，而是：
+
+```python
+if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+    return self.model.compute_logits(self.model(input_ids, positions))
+else:
+    ...
+    graph.replay()
+    return self.model.compute_logits(graph_vars["outputs"][:bs])
+```
+
+所以真正的逻辑是：
+
+- **prefill**：直接 eager
+- **强制 eager 模式**：直接 eager
+- **decode 但 batch 太大（> 512）**：也直接 eager
+- 其余 decode：走 CUDA Graph
+
+> - 这里的 eager，就是“即时执行模式”:Python 代码走到哪一层，PyTorch 就立刻把这一层对应的 CUDA kernel 发到 GPU 执行。Python 代码走到哪一层，PyTorch 就立刻把这一层对应的 CUDA kernel 发到 GPU 执行，所以它最灵活，形状变了也没关系，但每次都会有一串 kernel launch 开销
+> - CUDA Graph：预录好整段 GPU 动作再回放,先录一次，再反复回放，启动开销小，适合 decode 这种每步都很像的小计算
+
+### 6.2 为什么 decode 更适合 CUDA Graph
+
+因为 decode 的特征是：
+
+- 每条序列每轮只算 1 个 token
+- 单步算量不大
+- 但每层仍然要发起一长串 kernel
+
+此时 CPU 发 kernel 的 launch 开销占比会变得更明显，Graph replay 的收益更高。
+
+而 prefill 通常：
+
+- token 数更多
+- shape 波动更大
+- 单步算量更重
+
+所以 launch 开销相对没那么显眼，capture 的复用价值也更低。
+
+### 6.3 当前 CUDA Graph 的捕获方式
+
+`capture_cudagraph()` 里会先准备一套最大 buffer：
+
+- `input_ids`
+- `positions`
+- `slot_mapping`
+- `context_lens`
+- `block_tables`
+- `outputs`
+
+然后构造一组批大小：
+
+```python
+self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+```
+
+也就是：
+
+- 小 batch 精细捕获：1、2、4、8
+- 大一些的 batch 按 16 对齐：16、32、48 ...
+
+运行时，如果本轮 decode 的真实 batch size 是 `bs`，就选：
+
+```python
+next(x for x in self.graph_bs if x >= bs)
+```
+
+也就是**第一个不小于 `bs` 的 graph** 来回放。
+
+### 6.4 Graph replay 前为什么要把上下文 buffer 重写一遍
+
+因为 graph capture 期间绑定的是固定地址的 buffer。
+
+所以实际 decode 时，不是重新分配新 tensor，而是把本轮的数据拷进旧 buffer：
+
+```python
+graph_vars["input_ids"][:bs] = input_ids
+graph_vars["positions"][:bs] = positions
+graph_vars["slot_mapping"].fill_(-1)
+graph_vars["slot_mapping"][:bs] = context.slot_mapping
+graph_vars["context_lens"].zero_()
+graph_vars["context_lens"][:bs] = context.context_lens
+graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+```
+
+这里：
+
+- `slot_mapping.fill_(-1)` 是把无效位置清掉
+- `context_lens.zero_()` 是把未使用尾部清掉
+- `block_tables` 则把本轮实际需要的那部分覆盖进去
+
+这样 graph replay 才能在“地址不变”的前提下，吃到“内容更新”的输入。
+
+---
+
+## 七、`run()`：把准备、执行、采样串起来
+
+### 7.1 当前 `run()` 的真实流程
 
 ```python
 def run(self, seqs, is_prefill):
-    # 1. 构造输入
     input_ids, positions = (
-        self.prepare_prefill(seqs) if is_prefill
-        else self.prepare_decode(seqs)
+        self.prepare_prefill(seqs)
+        if is_prefill else
+        self.prepare_decode(seqs)
     )
-
-    # 2. 前向传播
+    temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
     logits = self.run_model(input_ids, positions, is_prefill)
-
-    # 3. 采样（仅 rank 0）
-    token_ids = (
-        self.sampler(logits, temperatures).tolist()
-        if self.rank == 0
-        else None
-    )
-
+    token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+    reset_context()
     return token_ids
 ```
 
-### 6.2 流程图
+主线非常短：
 
-```
-run(seqs, is_prefill)
-    │
-    ├── is_prefill == True
-    │       └── prepare_prefill(seqs)
-    │               ├── 构造 input_ids（拼接所有序列的未缓存 token）
-    │               ├── 构造 positions（位置编码索引）
-    │               ├── 构造 cu_seqlens_q, cu_seqlens_k（序列边界）
-    │               ├── 构造 slot_mapping（KV Cache 写入位置）
-    │               └── set_context(is_prefill=True, ...)
-    │
-    ├── is_prefill == False
-    │       └── prepare_decode(seqs)
-    │               ├── 构造 input_ids（每序列 1 个 last_token）
-    │               ├── 构造 positions（每序列 1 个位置）
-    │               ├── 构造 slot_mapping（1 个新 slot）
-    │               ├── 构造 context_lens, block_tables
-    │               └── set_context(is_prefill=False, ...)
-    │
-    ├── run_model(input_ids, positions, is_prefill)
-    │       ├── Prefill/Eager → self.model(input_ids, positions)
-    │       └── Decode/Graph  → self.graph_runners[bs].run(...)
-    │       └── 返回 logits: [num_tokens, vocab_size]
-    │
-    └── sampler(logits, temperatures)
-            ├── logits / temperature
-            ├── softmax → 概率分布
-            ├── multinomial 采样
-            └── 返回 token_ids: [num_seqs]
+```text
+先准备输入
+  -> 再跑模型
+  -> 再采样
+  -> 再清 context
 ```
 
-### 6.3 为什么只有 rank 0 做采样
+### 7.2 为什么只有 rank 0 采样
 
-```python
-token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-```
+因为在张量并行里：
 
-在张量并行中，所有 rank 运行相同的模型前向传播（只是每个 rank 处理不同的注意力头/FFN 分片）。最终的 logits 在 `lm_head`（`VocabParallelEmbedding`）的 `forward` 中通过 `all_gather` 汇总到所有 rank。
+- 各 rank 都要参与模型前向
+- 但真正要把 logits 变成 token，只需要做一次
 
-但**采样只需要做一次**——由 rank 0 执行，然后通过 `SharedMemory` 或其他机制将结果分发给其他 rank。这避免了：
-1. 重复计算（采样虽然快，但没必要重复）
-2. 不一致的随机采样结果（不同 rank 的随机种子可能不同）
+当前 `ParallelLMHead` 在 TP>1 时会把各 rank 的 vocab 分片 gather 到 rank 0，所以最终只有 rank 0 真正拿到完整 logits，采样也自然只在 rank 0 做。
 
-### 6.4 Sampler 的实现
+### 7.3 `reset_context()` 为什么不能漏
 
-```python
-class Sampler:
-    def __call__(self, logits, temperatures):
-        # 1. 温度缩放
-        logits = logits / temperatures.unsqueeze(-1)
-        # 2. Softmax 转概率
-        probs = torch.softmax(logits, dim=-1)
-        # 3. 多项式采样
-        token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        return token_ids
-```
+`context` 是全局状态。
 
-温度的作用：
-- `temperature = 1.0`：标准采样
-- `temperature > 1.0`：分布更平坦，输出更随机
-- `temperature → 0`：趋近 argmax（贪心），但 nano-vllm 不允许 temperature=0
+如果不在一次 `run()` 结束后清掉，下一轮可能会错误复用上一轮的：
+
+- `is_prefill`
+- `slot_mapping`
+- `cu_seqlens`
+- `block_tables`
+
+这类“脏上下文串到下一轮”的 bug 非常难查，所以 `reset_context()` 是这里一个很关键但常被忽略的收尾动作。
 
 ---
 
-## 七、多进程通信（SharedMemory）
+## 八、多 GPU：`call()`、SharedMemory 和 `Sequence` 序列化
 
-### 7.1 为什么需要 SharedMemory
+### 8.1 rank 0 和其他 rank 的分工
 
-在张量并行（TP > 1）中，每个 GPU 运行一个独立进程。调度器运行在 rank 0 的进程中，它需要将序列信息传递给其他 rank 的 `ModelRunner`。
+在 TP > 1 时：
 
-```
-Rank 0（主进程）:
-  LLMEngine → Scheduler → ModelRunner (rank 0)
-                              │
-                         SharedMemory
-                              │
-Rank 1（子进程）:             ModelRunner (rank 1)
-Rank 2（子进程）:             ModelRunner (rank 2)
-```
+- `rank 0` 负责和调度器所在主流程对接
+- `rank > 0` 在初始化后直接进入 `loop()`
 
-### 7.2 通信机制
-
-**Rank 0 写入 SharedMemory**：
+`loop()` 会一直做：
 
 ```python
-def write_shm(self, method_name, *args):
-    data = pickle.dumps([method_name, *args])
-    n = len(data)
-    self.shm.buf[0:4] = n.to_bytes(4, "little")   # 前 4 字节存长度
-    self.shm.buf[4:n+4] = data                      # 之后存序列化数据
+while True:
+    method_name, args = self.read_shm()
+    self.call(method_name, *args)
+    if method_name == "exit":
+        break
 ```
 
-**Rank 1+ 读取 SharedMemory**：
+也就是等待 rank 0 发来“要调用哪个方法、参数是什么”，然后在本地执行同一个方法。
 
-```python
-def loop(self):
-    while True:
-        # 等待信号
-        event.wait()
-        event.clear()
+### 8.2 `call()` 的本质：一个很轻量的本地 RPC
 
-        # 从 SharedMemory 读取
-        n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-
-        # 调用对应方法
-        getattr(self, method_name)(*args)
-```
-
-### 7.3 call 方法：跨进程方法调用
+当前实现里：
 
 ```python
 def call(self, method_name, *args):
-    if self.world_size > 1:
+    if self.world_size > 1 and self.rank == 0:
         self.write_shm(method_name, *args)
-        self.event.set()   # 通知其他 rank
-    return getattr(self, method_name)(*args)
+    method = getattr(self, method_name, None)
+    return method(*args)
 ```
 
-这实现了一种**简单的 RPC**：
-1. Rank 0 将方法名和参数序列化写入 SharedMemory
-2. 通过 `Event` 通知其他 rank
-3. 所有 rank 调用相同的方法（如 `run(seqs, is_prefill)`）
-4. 各 rank 独立执行前向传播（张量并行自动处理权重分片和 AllReduce）
+这意味着：
 
-### 7.4 Sequence 的序列化优化
+1. rank 0 先把方法名和参数写入 SharedMemory；
+2. 通过 `Event` 唤醒其他 rank；
+3. 所有 rank 各自在本进程里调用同名方法；
+4. 模型内部的张量并行通信由 NCCL 自己完成。
 
-在通过 SharedMemory 传递时，`Sequence` 对象需要被 `pickle.dumps()` 序列化。这就是 `__getstate__` 优化的用武之地：
+所以 SharedMemory 传的不是大张量，而是：
+
+- 方法名
+- `Sequence` 对象
+- `is_prefill` 之类的小元信息
+
+### 8.3 当前 SharedMemory 协议长什么样
+
+`write_shm()` 会把：
 
 ```python
-# sequence.py
+[method_name, *args]
+```
+
+先 `pickle.dumps()` 成 bytes，然后：
+
+- 前 4 字节写长度
+- 后面写真实 payload
+
+其他 rank 在 `read_shm()` 里反序列化回来。
+
+这个设计朴素，但很适合 nano-vllm 这种教学实现：
+
+- 它不追求跨节点
+- 不追求复杂 RPC 语义
+- 只追求“同机多进程把这轮调用同步起来”
+
+### 8.4 `Sequence.__getstate__()` 的优化点
+
+这一节最好和课程 11 连起来看。
+
+当前 `Sequence` 的序列化逻辑是：
+
+```python
 def __getstate__(self):
-    return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
-            self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+    last_state = self.last_token if not self.is_prefill else self.token_ids
+    return (
+        self.num_tokens,
+        self.num_prompt_tokens,
+        self.num_cached_tokens,
+        self.num_scheduled_tokens,
+        self.block_table,
+        last_state,
+    )
 ```
 
-Decode 阶段只传 5 个值（而非整个 token 列表），大幅减少序列化开销。对于 batch_size=256、平均序列长度 1000 的场景：
+这说明：
 
-```
-不优化：256 × 1000 × 4 bytes ≈ 1 MB 序列化数据
-优化后：256 × 5 × 8 bytes ≈ 10 KB 序列化数据
-减少 100 倍！
-```
+- **prefill** 时，要把完整 `token_ids` 发过去，因为 `prepare_prefill()` 需要切片 `seq[start:end]`
+- **decode** 时，只发 `last_token` 就够了，因为 `prepare_decode()` 根本不需要整条 `token_ids`
 
-### 7.5 SharedMemory vs NCCL vs gRPC
+这是一个很实用的优化，因为 decode 阶段真正需要的只是：
 
-| 通信方式 | 适用场景 | 优点 | 缺点 |
-|---------|---------|------|------|
-| SharedMemory | 同一节点进程间通信 | 零拷贝、低延迟 | 仅限单节点 |
-| NCCL | GPU 间张量通信 | 高带宽、支持多节点 | 只能传 tensor |
-| gRPC | 跨节点 RPC | 灵活、跨语言 | 延迟较高 |
+- 当前总长度 `num_tokens`
+- prompt 长度 `num_prompt_tokens`
+- 当前缓存进度 `num_cached_tokens`
+- 本轮调度量 `num_scheduled_tokens`
+- `block_table`
+- `last_token`
 
-nano-vllm 的设计：
-- **NCCL**：用于张量并行中的 AllReduce（模型前向传播中的张量通信）
-- **SharedMemory**：用于传递序列元信息（方法名、Sequence 对象等非张量数据）
+而不是整条历史 token 列表。
 
----
+### 8.5 一个细节：这里影响序列化的是 `seq.is_prefill`
 
-## 八、Warmup 与显存管理
-
-### 8.1 warmup_model 的作用
+注意，`__getstate__()` 分支依据的是：
 
 ```python
-def warmup_model(self):
-    dummy_input_ids = torch.zeros(self.max_num_batched_tokens, dtype=torch.long, device="cuda")
-    dummy_positions = torch.zeros(self.max_num_batched_tokens, dtype=torch.long, device="cuda")
-    self.model(dummy_input_ids, dummy_positions)
-    torch.cuda.synchronize()
+seq.is_prefill
 ```
 
-Warmup 的目的：
+而不是 `run(..., is_prefill)` 的参数。
 
-1. **Triton Kernel 编译**：首次执行时，Triton 会 JIT 编译自定义的注意力核、LayerNorm 核等。编译耗时可达数秒，warmup 将这个延迟前置。
-2. **CUDA 内存池初始化**：PyTorch 的 CUDA 内存分配器在首次分配时会建立内存池。warmup 后，后续分配会从池中获取，更快。
-3. **cuBLAS 句柄初始化**：矩阵乘法库 cuBLAS 在首次调用时需要初始化，warmup 将这个开销前置。
-4. **确定显存峰值**：warmup 后调用 `torch.cuda.max_memory_allocated()` 可以得到前向传播的显存峰值，用于后续 KV Cache 的分配计算。
+这再次说明：
 
-### 8.2 显存预算分配
+- `run(..., is_prefill)` 是这一步批量执行路径
+- `seq.is_prefill` 是序列自己的调度态字段
 
-GPU 显存的分配遵循以下优先级：
-
-```
-GPU 总显存（如 80 GB）
-├── 模型权重（如 14 GB）          ← 固定
-├── 前向传播激活值峰值（如 2 GB）  ← warmup 后确定
-├── CUDA 运行时开销（如 1 GB）     ← 固定
-├── KV Cache（如 58 GB）          ← allocate_kv_cache 分配
-└── 预留余量（如 5 GB）            ← gpu_memory_utilization < 1.0
-```
-
-`gpu_memory_utilization` 参数（默认 0.9）控制了 KV Cache 最多使用多少比例的总显存。设为 0.9 意味着保留 10% 的显存余量，防止 OOM。
+两者通常会对齐，但概念层面不是一回事。
 
 ---
 
 ## 九、面试高频考点
 
-### Q1：ModelRunner 的 prepare_prefill 和 prepare_decode 有什么区别？
+### Q1：`ModelRunner` 和 `Scheduler` 的核心分工是什么？
 
-**参考答案**：
+**标准回答：**
 
-| 维度 | prepare_prefill | prepare_decode |
-|------|----------------|----------------|
-| 输入 token 数 | 每序列 seqlen - num_cached_tokens | 每序列 1（last_token） |
-| 数据格式 | 变长拼接 + cu_seqlens | 等长（每序列 1 token） |
-| slot_mapping | 多个 slot（每个需计算的 token 一个） | 1 个 slot |
-| 注意力路径 | flash_attn_varlen_func | flash_attn_with_kvcache |
-| CUDA Graph | 不使用（形状不固定） | 使用（形状由 batch_size 决定） |
+`Scheduler` 决定“谁上场、每条序列这轮算多少 token、是否需要抢占、物理 block 是否够用”；`ModelRunner` 不做这些决策，它只接收已经被选中的 `seqs` 和 `is_prefill`，把它们组织成 `input_ids`、`positions`、`slot_mapping`、`cu_seqlens`、`context_lens`、`block_tables` 等张量，再驱动模型前向和采样。可以把 `ModelRunner` 概括为“调度层到 attention kernel 的翻译层”。
 
-### Q2：为什么 KV Cache 的分配要在 warmup 之后？
+### Q2：为什么说 `prepare_prefill()` 不是“把剩余 prompt 一次性全算完”？
 
-**参考答案**：
+**标准回答：**
 
-因为 warmup 会占用 GPU 显存（编译 Triton kernel、建立 CUDA 内存池等），并且 warmup 过程中的显存峰值决定了前向传播所需的最大工作空间。只有在 warmup 之后，才能准确知道"剩余多少显存可以分配给 KV Cache"。如果在 warmup 之前分配，可能分配过多导致 OOM，或分配过少导致浪费。
+因为当前实现严格按 `Scheduler` 写进 `Sequence` 的 `num_scheduled_tokens` 来执行。`prepare_prefill()` 里真正的核心是：
 
-### Q3：nano-vllm 如何实现多 GPU 推理中的通信？
+```python
+start = seq.num_cached_tokens
+seqlen_q = seq.num_scheduled_tokens
+end = start + seqlen_q
+seqlen_k = end
+```
 
-**参考答案**：
+也就是说，它只处理本轮 `[start, end)` 这段新 token。长 prompt 可能被拆成多轮 partial prefill，每轮只算一段，而不是默认整段剩余 prompt 全部送进模型。
 
-两种通信机制：
-1. **NCCL AllReduce**：用于模型前向传播中的张量通信。在 `RowParallelLinear` 和 `VocabParallelEmbedding` 中，各 rank 计算部分结果后通过 AllReduce 汇总。这是高带宽的 GPU 间通信。
-2. **SharedMemory + pickle**：用于传递序列元信息。Rank 0 将方法名和 Sequence 对象序列化后写入共享内存，通过 Event 通知其他 rank 读取。`Sequence.__getstate__` 做了优化，decode 阶段只传 5 个基本值。
+### Q3：`prepare_prefill()` 和 `prepare_decode()` 的本质区别是什么？
 
-### Q4：请解释 cu_seqlens 的含义及其在变长注意力中的作用。
+**标准回答：**
 
-**参考答案**：
+prefill 是“每条序列本轮可能输入多个 token 的变长批处理”，所以它要拼一维 `input_ids`，再用 `cu_seqlens_q / cu_seqlens_k` 标边界；decode 是“每条序列本轮只输入 1 个 token”，所以它不需要 `cu_seqlens`，而是需要 `context_lens` 和 `block_tables` 告诉 kernel 每条序列已有多长历史、历史分布在哪些物理 block 里。两者对应的 attention kernel 也不同：prefill 走 `flash_attn_varlen_func`，decode 走 `flash_attn_with_kvcache`。
 
-`cu_seqlens`（cumulative sequence lengths）是 FlashAttention 变长接口的核心输入。它是一个一维整数数组，长度为 `num_seqs + 1`，记录每个序列在拼接后张量中的累积起始位置。
+### Q4：`slot_mapping`、`block_tables`、`cu_seqlens`、`context_lens` 各自是干什么的？
 
-例如 3 个序列长度为 [100, 150, 200]，`cu_seqlens = [0, 100, 250, 450]`。FlashAttention 通过 `cu_seqlens[i]` 和 `cu_seqlens[i+1]` 确定第 i 个序列在拼接张量中的范围，避免了 Padding。
+**标准回答：**
 
-在前缀缓存场景下，`cu_seqlens_q` 和 `cu_seqlens_k` 可能不同：Q 只包含未缓存的 token，K 包含所有 token（含缓存部分）。
+- `slot_mapping`：把“这轮新算出来的 token”映射到 KV Cache 的物理写入位置，`store_kvcache()` 会直接按它写 K/V。
+- `block_tables`：把逻辑 token 位置映射到物理 block，供 paged KV 读取历史缓存。
+- `cu_seqlens_q / cu_seqlens_k`：只在 prefill 里用，告诉 `flash_attn_varlen_func` 变长拼接后每条序列的边界。
+- `context_lens`：只在 decode 里用，告诉 `flash_attn_with_kvcache` 每条序列当前历史长度。
 
-### Q5：CUDA Graph 在 Decode 阶段能带来多少加速？为什么 Prefill 不用？
+### Q5：为什么 warmup 要先于 KV Cache 分配？
 
-**参考答案**：
+**标准回答：**
 
-加速效果：Decode 阶段每步的计算量小（每序列只有 1 个 token），但 CUDA kernel 数量多（每层有多个 kernel）。CPU→GPU 的 launch 开销可能占总耗时的 30-50%。CUDA Graph 将所有 kernel 打包为一次 replay，消除了 launch 开销，通常可加速 1.5-2 倍。
+因为 KV Cache 的可分配大小依赖“模型权重加载后还剩多少显存”和“真实前向传播峰值显存是多少”。`warmup_model()` 会触发 kernel 编译、内存池初始化，并让 `torch.cuda.memory_stats()` 记录更接近真实运行的峰值；只有在这之后，`allocate_kv_cache()` 才能比较准确地计算还能拿多少显存给 KV Cache。
 
-Prefill 不用的原因：
-1. Prefill 的输入长度不固定，无法预先捕获所有可能的形状
-2. Prefill 的 kernel 执行时间远大于 launch 开销，CUDA Graph 的边际收益小
-3. FlashAttention 的变长接口对 CUDA Graph 支持有限
+### Q6：为什么 decode 更适合 CUDA Graph？
 
-### Q6：slot_mapping 在 Prefill 和 Decode 阶段分别代表什么？
+**标准回答：**
 
-**参考答案**：
+decode 每条序列每轮通常只算 1 个 token，单步计算量小，但每层依然有一串 kernel，CPU launch 开销占比会更明显；CUDA Graph 能把这一串 launch 打包成一次 replay，收益更高。prefill 的 token 更多、shape 波动更大、单步算量更重，所以 graph capture 的复用性和边际收益都更差。当前实现里也不是所有 decode 都强制用 graph，`enforce_eager=True` 或 `batch_size > 512` 时仍会直接 eager。
 
-`slot_mapping` 将 token 映射到 KV Cache 的物理位置。计算公式：`slot = block_id × block_size + block内偏移`。
+### Q7：nano-vllm 的多 GPU `ModelRunner` 是怎么协同的？
 
-- **Prefill**：为每个需要计算的 token 生成一个 slot。如果有前缀缓存，只为未缓存的 token 生成 slot（从 `num_cached_blocks` 开始）。所有新计算的 K/V 会被批量写入这些 slot。
-- **Decode**：每个序列只有 1 个 slot，指向最后一个 block 的当前写入位置。新生成的 K/V 写入这一个 slot。
+**标准回答：**
 
-### Q7：如果让你优化 ModelRunner，你会从哪些方面入手？
+rank 0 负责接收调度器调用，然后通过 SharedMemory + `Event` 把 `[method_name, *args]` 广播给其他 rank；其他 rank 在 `loop()` 里阻塞等待，收到后在本地执行同名方法。也就是说，SharedMemory 负责传“方法调用和序列元信息”，真正模型内部的张量并行通信仍由 NCCL 完成。为了减少 IPC 开销，`Sequence.__getstate__()` 在 decode 场景下只发送 `last_token` 而不是完整 `token_ids`。
 
-**参考答案**：
+### Q8：为什么一条序列可能已经被挪进 `running`，但这一轮 `ModelRunner` 仍然走的是 prefill？
 
-1. **Chunked Prefill**：将长 Prefill 拆分为 chunk，与 Decode 混合执行，减少 Decode 等待
-2. **更高效的序列化**：用 struct.pack 代替 pickle，进一步减少 SharedMemory 传输量
-3. **动态 CUDA Graph**：支持可变 batch size 的 CUDA Graph，或使用 CUDA Graph 的条件节点
-4. **异步 KV Cache 管理**：在前向传播的同时异步分配/释放 block
-5. **投机解码**：集成 draft model，减少大模型的 Decode 步数
-6. **量化 KV Cache**：将 KV Cache 从 FP16 压缩为 INT8/FP8，增加可容纳的 token 数
+**标准回答：**
+
+因为 `running` / `waiting` 是调度队列语义，而 `is_prefill` / `is_decode` 是这一轮执行路径语义，它们不是同一维度。当前 `schedule()` 在“这轮已经把 prompt 需要的 token 全部排进来了”时，就会先把序列从 `waiting` 挪到 `running`，表示它接下来具备进入 decode 轮转的资格；但这一轮真正交给 `ModelRunner.run(seqs, True)` 的仍然是 prefill 路径，直到这轮执行完、`postprocess()` 更新状态后，下一轮它才会按 decode 方式参与运行。
 
 ---
 
 ## 十、小结
 
-| 要点 | 内容 |
-|------|------|
-| **核心职责** | 将 Sequence 列表转化为 GPU 可执行的张量输入，驱动模型前向传播 |
-| **初始化顺序** | NCCL → 加载模型 → Warmup → 分配 KV Cache → 捕获 CUDA Graph |
-| **prepare_prefill** | 变长拼接 + cu_seqlens + slot_mapping，支持前缀缓存 |
-| **prepare_decode** | 每序列 1 token + block_tables + context_lens |
-| **执行模式** | Prefill = Eager，Decode = CUDA Graph |
-| **多 GPU 通信** | NCCL（张量）+ SharedMemory（元信息），Sequence 序列化优化 |
-| **KV Cache 分配** | 根据 GPU 剩余显存计算 block 数，6 维张量存储 |
+这一课真正要记住的，不是零散 API 名字，而是下面这条主线：
 
-**核心记忆口诀**：
+```text
+Scheduler 决定这轮谁上、上多少 token
+  -> ModelRunner 把这些序列翻译成模型输入和 attention 上下文
+  -> Attention 按 slot_mapping / block_tables 读写 paged KV Cache
+  -> lm_head + sampler 产出每条序列一个候选 token
+  -> Scheduler.postprocess() 决定这个 token 是否真的接到序列后面
+```
 
-> Prefill **拼一维**，cu_seqlens **划边界**；
-> Decode **取末 token**，slot_mapping **定位置**；
-> Eager 算 **大矩阵**，Graph 跑 **小向量**；
-> SharedMemory **传元信息**，NCCL **搬张量**。
+如果要把 `ModelRunner` 浓缩成一句面试回答，可以直接说：
 
-**下一课预告**：理解了 ModelRunner 如何执行模型后，我们将深入 **张量并行（Tensor Parallelism）**——理解 ColumnParallelLinear、RowParallelLinear 和 QKVParallelLinear 如何在多 GPU 间分割权重和计算。
+> **它是推理引擎的执行层入口，负责把调度结果组织成 GPU 可执行的张量与上下文，并在 eager / CUDA Graph、多卡协同、KV Cache 读写之间完成衔接。**
+
+最后给你一个记忆口诀：
+
+> `Scheduler` 管“谁上场”，`ModelRunner` 管“怎么摆”；  
+> prefill 看 `cu_seqlens`，decode 看 `context_lens`；  
+> `slot_mapping` 定写回位置，`block_tables` 定历史映射；  
+> `Attention` 真正算注意力，`postprocess()` 才决定 token 是否落袋。

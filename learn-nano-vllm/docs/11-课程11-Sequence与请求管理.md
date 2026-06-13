@@ -4,6 +4,47 @@
 
 ---
 
+## 零、先讲人话版
+
+如果你第一次读这课，建议先不要一上来就盯源码细节。先记住一句话：
+
+> `Sequence` 就是“推理引擎里，一条请求在运行时的档案袋”。
+
+这个“档案袋”主要回答 4 个问题：
+
+1. **这条请求现在处于什么阶段？**
+   看 `status`，它会在 `WAITING / RUNNING / FINISHED` 之间变化。
+2. **这条请求一共有哪些 token？**
+   看 `token_ids`、`num_tokens`、`num_prompt_tokens`。
+3. **这条请求的 KV Cache 放在显存哪里？**
+   看 `block_table`，它记录“逻辑 block -> 物理 block”的映射。
+4. **这一轮到底要算多少 token？**
+   看 `num_cached_tokens` 和 `num_scheduled_tokens`：
+   `num_cached_tokens` 表示“已经有 KV Cache 的部分”，`num_scheduled_tokens` 表示“这一轮真正要送进模型计算的部分”。
+
+把它放进完整流程里，其实只有下面这条主线：
+
+```text
+用户请求进来
+  -> 包装成 Sequence
+  -> 进入 waiting 队列
+  -> Scheduler 决定这轮让它算多少 token（num_scheduled_tokens）
+  -> ModelRunner 按 Sequence 里的信息准备张量并前向
+  -> postprocess 更新缓存/token/状态
+  -> 没结束就继续下一轮，结束就回收 block
+```
+
+如果你读到后面开始晕，可以随时退回来，只问自己下面这 4 句话：
+
+- 这条请求现在是 `WAITING`、`RUNNING` 还是 `FINISHED`？
+- 这轮是 **prefill** 还是 **decode**？
+- 哪些 token 已经有缓存，哪些 token 这轮还要算？
+- 这条请求对应的 KV Cache block 在哪里？
+
+带着这 4 个问题再看后面的属性和方法，文档会顺很多。
+
+---
+
 ## 一、为什么需要 Sequence 类
 
 ### 1.1 推理引擎中的"请求"
@@ -158,6 +199,8 @@ def __init__(self, token_ids, sampling_params=SamplingParams()):
     self.num_tokens = len(self.token_ids)
     self.num_prompt_tokens = len(token_ids)
     self.num_cached_tokens = 0
+    self.num_scheduled_tokens = 0
+    self.is_prefill = True
     self.block_table = []
     self.temperature = sampling_params.temperature
     self.max_tokens = sampling_params.max_tokens
@@ -175,6 +218,8 @@ def __init__(self, token_ids, sampling_params=SamplingParams()):
 | `num_tokens` | int | len(token_ids) | 当前总 token 数（prompt + completion） |
 | `num_prompt_tokens` | int | len(token_ids) | prompt 的 token 数量，**创建后不变** |
 | `num_cached_tokens` | int | 0 | 已被 KV Cache 缓存的 token 数量（用于前缀缓存） |
+| `num_scheduled_tokens` | int | 0 | 当前调度轮次准备实际计算的 token 数；prefill 可能大于 1，decode 通常等于 1 |
+| `is_prefill` | bool | True | 当前这一轮是否走 prefill 路径；它是调度态信息，不只是“还没生成过 token”这么简单 |
 | `block_table` | list[int] | [] | 物理 block 索引列表，记录 KV Cache 的存储位置 |
 | `temperature` | float | 来自 sampling_params | 采样温度：0 为贪心，越大越随机 |
 | `max_tokens` | int | 来自 sampling_params | 最大生成 token 数 |
@@ -329,7 +374,7 @@ append_token(200):
 
 1. **decode 阶段**只需要最后一个 token 作为输入，直接读 `last_token` 是 O(1) 操作
 2. 如果每次都从 `token_ids[-1]` 获取，虽然 Python 列表索引也是 O(1)，但 `last_token` 作为独立属性在序列化传输时可以避免传输整个 token_ids 列表
-3. 在 `__getstate__` 中，如果序列已经有 completion token，只传输 `last_token` 而非完整 `token_ids`
+3. 在 `__getstate__` 中，如果当前这一轮走 decode 路径，只传输 `last_token` 而非完整 `token_ids`
 
 ### 5.4 append_token 不更新 block_table
 
@@ -367,20 +412,26 @@ if seq.num_completion_tokens == seq.max_tokens:
     seq.status = SequenceStatus.FINISHED
 ```
 
-### 6.3 is_prefill / is_finished 属性
+### 6.3 is_prefill / is_finished
 
 ```python
-@property
-def is_prefill(self):
-    return self.num_completion_tokens == 0
+self.is_prefill = True
 
 @property
 def is_finished(self):
     return self.status == SequenceStatus.FINISHED
 ```
 
-- `is_prefill`：如果还没有生成任何 completion token，说明这个序列还在 prefill 阶段
+- `is_prefill`：这是一个**普通字段**，由调度器维护，表示“当前这一轮是否按 prefill 方式准备输入”
 - `is_finished`：判断序列是否已完成
+
+这里很容易误解。当前源码里，`is_prefill` **不是**通过 `num_completion_tokens == 0` 动态推导出来的，而是由调度器显式设置：
+
+- 新请求创建时，`is_prefill = True`
+- 请求被抢占重新排队时，`Scheduler.preempt()` 会把它重置为 `True`
+- 进入 decode 调度分支时，`Scheduler.schedule()` 会把它设为 `False`
+
+为什么要这样设计？因为它表达的是“**这一轮模型输入该怎么准备**”，而不只是“这条序列历史上有没有生成过 token”。这个字段会直接影响 `__getstate__` 序列化时传完整 `token_ids` 还是只传 `last_token`。
 
 ---
 
@@ -394,15 +445,22 @@ def is_finished(self):
 
 ```python
 def __getstate__(self):
-    return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
-            self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+    last_state = self.last_token if not self.is_prefill else self.token_ids
+    return (
+        self.num_tokens,
+        self.num_prompt_tokens,
+        self.num_cached_tokens,
+        self.num_scheduled_tokens,
+        self.block_table,
+        last_state,
+    )
 ```
 
 **精妙之处**：
 
-1. **Prefill 阶段**（`num_completion_tokens == 0`）：传输完整 `token_ids`，因为 worker 需要所有 prompt token 来计算 KV Cache
-2. **Decode 阶段**（`num_completion_tokens > 0`）：只传输 `last_token`，因为 worker 只需要最后一个 token 作为输入
+1. **Prefill 路径**（`is_prefill == True`）：传输完整 `token_ids`，因为 worker 需要把这轮要算的 prompt/prefix token 真正喂进模型
+2. **Decode 路径**（`is_prefill == False`）：只传输 `last_token`，因为 worker 这一轮只需要最后一个 token 作为输入
+3. `num_scheduled_tokens` 也要一起传，因为 worker 需要知道“这轮实际要处理多少 token”
 
 ### 7.3 传输数据量对比
 
@@ -411,7 +469,7 @@ def __getstate__(self):
 | 方式 | 传输数据 | 大小估算 |
 |------|---------|---------|
 | 不优化 | 完整对象（所有属性 + 1500 token_ids） | ~12KB |
-| `__getstate__` 优化 | num_tokens + num_prompt_tokens + num_cached_tokens + block_table + last_token | ~100B |
+| `__getstate__` 优化 | num_tokens + num_prompt_tokens + num_cached_tokens + num_scheduled_tokens + block_table + last_token | ~100B |
 
 decode 阶段的传输量减少了约 **100 倍**！
 
@@ -419,17 +477,28 @@ decode 阶段的传输量减少了约 **100 倍**！
 
 ```python
 def __setstate__(self, state):
-    self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data = state
-    if isinstance(token_data, list):
-        self.token_ids = token_data
+    self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+    if isinstance(last_state, list):
+        self.token_ids = last_state
+        self.last_token = self.token_ids[-1]
     else:
-        self.last_token = token_data
+        self.token_ids = []
+        self.last_token = last_state
 ```
 
-接收端根据 `token_data` 的类型判断当前阶段：
+接收端根据 `last_state` 的类型判断当前路径：
 
-- 如果是 `list`：说明是 prefill 阶段，`token_data` 就是完整的 `token_ids`
-- 如果是 `int`：说明是 decode 阶段，`token_data` 就是 `last_token`
+- 如果是 `list`：说明这一轮走 prefill，`last_state` 就是完整的 `token_ids`
+- 如果是 `int`：说明这一轮走 decode，`last_state` 就是 `last_token`
+
+注意 decode 反序列化后，worker 侧的 `token_ids` 会是空列表，这并不奇怪。因为 decode 路径真正需要的是：
+
+- `num_tokens`：知道当前位置
+- `last_token`：作为本轮输入
+- `block_table`：定位 KV Cache
+- `num_scheduled_tokens`：知道这一轮算多少
+
+也就是说，worker 并不需要持有完整历史 token 列表。
 
 ### 7.5 序列化在系统中的使用场景
 
@@ -464,11 +533,13 @@ scheduler.add(seq)  # seq 加入 waiting 队列
 
 # Scheduler 调度时
 scheduler.schedule()
+    → seq.num_scheduled_tokens = ...
     → seq.status = SequenceStatus.RUNNING
     → block_manager.allocate(seq)  # 填充 seq.block_table
 
 # Scheduler 后处理时
 scheduler.postprocess(seqs, token_ids)
+    → seq.num_cached_tokens += seq.num_scheduled_tokens
     → seq.append_token(token_id)
     → 检查 seq.num_completion_tokens == seq.max_tokens
 ```
@@ -633,6 +704,8 @@ p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}
 | `num_tokens` | `__init__`, `append_token` | Scheduler, ModelRunner | 批处理计算 |
 | `num_prompt_tokens` | `__init__` | Scheduler | 判断 prefill/decode |
 | `num_cached_tokens` | `__init__`, BlockManager | Scheduler, ModelRunner | 前缀缓存 |
+| `num_scheduled_tokens` | `__init__`, Scheduler | Scheduler, ModelRunner | 当前轮次真实计算量 |
+| `is_prefill` | `__init__`, Scheduler | ModelRunner, pickle | 决定当前轮次按 prefill 还是 decode 路径处理 |
 | `block_table` | `__init__`, BlockManager | ModelRunner | KV Cache 寻址 |
 | `num_blocks` | 计算属性 | BlockManager | block 分配 |
 | `last_block_num_tokens` | 计算属性 | ModelRunner | slot_mapping 计算 |
